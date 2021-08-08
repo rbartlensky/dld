@@ -6,7 +6,7 @@ pub enum ErrorType {
     #[error("{0}")]
     Io(#[from] io::Error),
     #[error("{0}")]
-    Elf(#[from] goblin::error::Error),
+    ElfWrite(#[from] goblin::error::Error),
     #[error("Not an elf.")]
     NotAnElf,
     #[error("{0}")]
@@ -38,11 +38,11 @@ impl fmt::Display for Error<'_> {
 }
 
 pub trait ErrorExt<T> {
-    fn map_path_err<'p>(self, path: &'p Path) -> Result<T, Error<'p>>;
+    fn map_path_err(self, path: &Path) -> Result<T, Error<'_>>;
 }
 
 impl<T, E: Into<ErrorType>> ErrorExt<T> for Result<T, E> {
-    fn map_path_err<'p>(self, path: &'p Path) -> Result<T, Error<'p>> {
+    fn map_path_err(self, path: &Path) -> Result<T, Error<'_>> {
         self.map_err(|e| Error::new(path, e))
     }
 }

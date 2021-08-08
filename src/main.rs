@@ -25,7 +25,7 @@ fn main() -> Result<(), String> {
         println!("{}", HELP);
         return Ok(());
     }
-    let out = args.output.unwrap_or(PathBuf::from("out"));
+    let out = args.output.unwrap_or_else(|| PathBuf::from("out"));
     if let Err(e) = dld::link(&args.inputs, &out) {
         Err(format!("{}", e))
     } else {
