@@ -1,6 +1,21 @@
-use crate::serialize::Serialize;
-use goblin::elf64::{header::{Header, ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64, ET_EXEC, EV_CURRENT}, program_header::{ProgramHeader, PF_R, PF_X, PT_LOAD}, section_header::{SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_STRTAB, SectionHeader}};
-use std::{collections::HashMap, fs::File, io::Write, iter::FromIterator, path::Path};
+use crate::{error::ErrorType, serialize::Serialize, symbol::Symbol};
+use goblin::elf64::{
+    header::{Header, ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64, ET_EXEC, EV_CURRENT},
+    program_header::{ProgramHeader, PF_R, PF_X, PT_LOAD},
+    section_header::{
+        SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_NULL, SHT_PROGBITS,
+        SHT_STRTAB, SHT_SYMTAB,
+    },
+    sym::{Sym, STB_LOCAL},
+};
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    fs::File,
+    io::Write,
+    path::Path,
+};
+
+use crate::name::Name;
 
 /// HEADER
 /// PH1
@@ -9,7 +24,8 @@ use std::{collections::HashMap, fs::File, io::Write, iter::FromIterator, path::P
 pub struct Writer<'d> {
     out: File,
     eh: Header,
-    names: HashMap<&'static str, usize>,
+    names: HashMap<Name, usize>,
+    symbols: HashMap<Symbol<'d>, Vec<Sym>>,
     string_tab_len: usize,
     program_headers: Vec<ProgramHeader>,
     section_headers: Vec<SectionHeader>,
@@ -56,6 +72,7 @@ impl<'d> Writer<'d> {
             out,
             eh,
             names: Default::default(),
+            symbols: Default::default(),
             string_tab_len: 0,
             program_headers: vec![],
             section_headers: vec![],
@@ -65,12 +82,14 @@ impl<'d> Writer<'d> {
         Ok(s)
     }
 
-    fn get_or_create_name(&mut self, name: &'static str) -> (usize, bool) {
+    fn get_or_create_name(&mut self, name: impl Into<Name>) -> (usize, bool) {
         let mut new = false;
         let mut add_len = 0;
+        let name = name.into();
+        let len = name.len();
         let v = self.string_tab_len;
         let index = self.names.entry(name).or_insert_with(|| {
-            add_len = name.len() + 1;
+            add_len = len + 1;
             new = true;
             v
         });
@@ -127,6 +146,37 @@ impl<'d> Writer<'d> {
         }
     }
 
+    pub fn add_symbol<'s>(
+        &mut self,
+        mut elf_sym: Sym,
+        name: &'s str,
+        reference: &'d Path,
+    ) -> Result<(), ErrorType> {
+        let name = name.to_string();
+        elf_sym.st_name = self.get_or_create_name(name.clone()).0 as u32;
+        let sym = Symbol::new(name, &elf_sym, reference);
+        match self.symbols.entry(sym) {
+            Entry::Occupied(mut s) => {
+                if s.key().is_global() {
+                    Err(ErrorType::Other(format!(
+                        "Symbol {} already defined in {}",
+                        s.key().name(),
+                        s.key().reference().display()
+                    )))
+                } else if !s.key().is_weak() {
+                    s.get_mut().push(elf_sym);
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            }
+            Entry::Vacant(v) => {
+                v.insert(vec![elf_sym]);
+                Ok(())
+            }
+        }
+    }
+
     pub fn grow_bss(&mut self, size: u64) {
         self.add_section(".bss", SHT_NOBITS, SHF_ALLOC | SHF_WRITE, 0, 0, 0, None, size);
     }
@@ -157,10 +207,14 @@ impl<'d> Writer<'d> {
         self.eh.e_phnum = 0;
 
         let strtab_name = self.get_or_create_name(".strtab").0;
+        let symtab_name = self.get_or_create_name(".symtab").0;
 
-        // + 1 for string table section
-        self.eh.e_shnum = self.section_headers.len() as u16 + 1;
-        let mut shoff = (std::mem::size_of::<Header>() + self.string_tab_len) as u64;
+        // + 2 for string and symbol table section
+        self.eh.e_shnum = self.section_headers.len() as u16 + 2;
+        let mut shoff = (std::mem::size_of::<Header>()
+            + self.string_tab_len
+            + self.symbols.values().flatten().count() * std::mem::size_of::<Sym>())
+            as u64;
         for sh in &self.section_headers {
             if let Some(data) = self.sections.get(&(sh.sh_name as usize)) {
                 for d in data {
@@ -189,8 +243,37 @@ impl<'d> Writer<'d> {
             }
         }
 
+        buf = Vec::with_capacity(std::mem::size_of::<Sym>());
+        // write the symbols
+        let mut syms: Vec<&Sym> = self.symbols.values().flatten().collect();
+        syms.sort_by(|s1, s2| (s1.st_info >> 4).cmp(&(s2.st_info >> 4)));
+        let mut last_local = 0;
+        for sym in syms {
+            sym.serialize(&mut buf);
+            let st_bind = sym.st_info >> 4;
+            if st_bind == STB_LOCAL {
+                last_local += 1;
+            }
+        }
+        self.out.write_all(&buf).unwrap();
+
+        // add our string table section header
+        self.section_headers.push(SectionHeader {
+            sh_name: symtab_name as u32,
+            sh_type: SHT_SYMTAB,
+            sh_flags: 0,
+            sh_addr: 0,
+            sh_offset: file_offset,
+            sh_size: buf.len() as u64,
+            sh_link: self.section_headers.len() as u32 + 1,
+            sh_info: last_local,
+            sh_addralign: 0,
+            sh_entsize: std::mem::size_of::<Sym>() as u64,
+        });
+        file_offset += buf.len() as u64;
+
         // write the string table to file
-        let mut names = self.names.into_iter().collect::<Vec<(&str, usize)>>();
+        let mut names = self.names.into_iter().collect::<Vec<(_, usize)>>();
         names.sort_by(|a, b| a.1.cmp(&b.1));
         for name in names {
             self.out.write_all(name.0.as_bytes()).unwrap();
@@ -212,7 +295,7 @@ impl<'d> Writer<'d> {
         });
 
         // write section headers to disk
-        let mut buf = Vec::with_capacity(std::mem::size_of::<SectionHeader>());
+        buf = Vec::with_capacity(std::mem::size_of::<SectionHeader>());
         for sh in self.section_headers {
             sh.serialize(&mut buf);
         }

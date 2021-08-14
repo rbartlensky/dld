@@ -1,5 +1,7 @@
 use byteorder::{LittleEndian, WriteBytesExt};
-use goblin::elf64::{header::Header, program_header::ProgramHeader, section_header::SectionHeader};
+use goblin::elf64::{
+    header::Header, program_header::ProgramHeader, section_header::SectionHeader, sym::Sym,
+};
 
 pub trait Serialize {
     fn serialize(&self, buf: &mut Vec<u8>);
@@ -49,5 +51,16 @@ impl Serialize for SectionHeader {
         buf.write_u32::<LittleEndian>(self.sh_info).unwrap();
         buf.write_u64::<LittleEndian>(self.sh_addralign).unwrap();
         buf.write_u64::<LittleEndian>(self.sh_entsize).unwrap();
+    }
+}
+
+impl Serialize for Sym {
+    fn serialize(&self, buf: &mut Vec<u8>) {
+        buf.write_u32::<LittleEndian>(self.st_name).unwrap();
+        buf.push(self.st_info);
+        buf.push(self.st_other);
+        buf.write_u16::<LittleEndian>(self.st_shndx).unwrap();
+        buf.write_u64::<LittleEndian>(self.st_value).unwrap();
+        buf.write_u64::<LittleEndian>(self.st_size).unwrap();
     }
 }

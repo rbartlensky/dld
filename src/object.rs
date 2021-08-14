@@ -1,13 +1,7 @@
-use crate::symbol::Symbol;
 use goblin::elf::{
     section_header::{SHT_NOBITS, SHT_PROGBITS},
-    sym::{STB_GLOBAL, STB_WEAK, STT_NOTYPE},
     Elf,
 };
-
-fn get_name<'e>(elf: &'e Elf<'e>, index: usize) -> Result<&'e str, String> {
-    elf.strtab.get_at(index).ok_or_else(|| "Symbol not found in strtab.".to_string())
-}
 
 pub struct Object<'e> {
     elf: Elf<'e>,
@@ -32,19 +26,12 @@ impl<'e> Object<'e> {
         Self { elf, buf, text_section, data_section, bss_section }
     }
 
-    pub fn global_symbols(&self) -> Result<Vec<(String, Symbol)>, crate::ErrorType> {
-        self.elf
-            .syms
-            .iter()
-            .filter(|sym| {
-                let bind = sym.st_bind();
-                (bind == STB_WEAK || bind == STB_GLOBAL) && sym.st_type() != STT_NOTYPE
-            })
-            .map(|sym| {
-                let name = get_name(&self.elf, sym.st_name)?;
-                Ok((name.into(), Symbol::new(sym.st_bind() == STB_WEAK)))
-            })
-            .collect()
+    pub fn get_name(&self, index: usize) -> Result<&'e str, String> {
+        self.elf.strtab.get_at(index).ok_or_else(|| "Symbol not found in strtab.".to_string())
+    }
+
+    pub fn symbols(&self) -> &goblin::elf::Symtab<'e> {
+        &self.elf.syms
     }
 
     pub fn text_section(&self) -> &[u8] {
