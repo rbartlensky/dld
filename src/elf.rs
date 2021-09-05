@@ -18,12 +18,15 @@ use std::{
 
 use crate::name::Name;
 
+mod string_table;
+use string_table::StringTable;
+
 pub struct Writer<'d> {
     out: File,
     eh: Header,
-    names: HashMap<Name, usize>,
+    section_names: StringTable,
+    symbol_names: StringTable,
     symbols: HashMap<Symbol<'d>, Vec<Sym>>,
-    string_tab_len: usize,
     program_headers: Vec<ProgramHeader>,
     section_headers: Vec<SectionHeader>,
     sections: HashMap<usize, Vec<u8>>,
@@ -68,30 +71,15 @@ impl<'d> Writer<'d> {
         let mut s = Self {
             out,
             eh,
-            names: Default::default(),
+            section_names: Default::default(),
+            symbol_names: Default::default(),
             symbols: Default::default(),
-            string_tab_len: 0,
             program_headers: vec![],
             section_headers: vec![],
             sections: Default::default(),
         };
         s.add_section("", SHT_NULL, 0, 0, 0, 0, None, 0);
         Ok(s)
-    }
-
-    fn get_or_create_name(&mut self, name: impl Into<Name>) -> (usize, bool) {
-        let mut new = false;
-        let mut add_len = 0;
-        let name = name.into();
-        let len = name.len();
-        let v = self.string_tab_len;
-        let index = self.names.entry(name).or_insert_with(|| {
-            add_len = len + 1;
-            new = true;
-            v
-        });
-        self.string_tab_len += add_len;
-        (*index, new)
     }
 
     fn add_section(
@@ -116,14 +104,14 @@ impl<'d> Writer<'d> {
         //     p_align: 0,
         // };
 
-        let (i, new) = self.get_or_create_name(name);
+        let entry = self.section_names.get_or_create(name);
         let size = data.as_ref().map(|d| d.len() as u64).unwrap_or(size);
         if let Some(data) = data {
-            self.sections.entry(i).and_modify(|v| v.extend(&data)).or_insert(data);
+            self.sections.entry(entry.index).and_modify(|v| v.extend(&data)).or_insert(data);
         }
-        if new {
+        if entry.new {
             let sh = SectionHeader {
-                sh_name: i as u32,
+                sh_name: entry.offset as u32,
                 sh_type: kind,
                 sh_flags: flags as u64,
                 // patched later on
@@ -138,7 +126,7 @@ impl<'d> Writer<'d> {
             };
             self.section_headers.push(sh);
         } else {
-            let sh = &mut self.section_headers[i];
+            let sh = &mut self.section_headers[entry.index];
             sh.sh_size += size;
         }
     }
@@ -169,7 +157,7 @@ impl<'d> Writer<'d> {
         reference: &'d Path,
     ) -> Result<(), ErrorType> {
         let name = name.to_string();
-        elf_sym.st_name = self.get_or_create_name(name.clone()).0 as u32;
+        elf_sym.st_name = self.symbol_names.get_or_create(name.clone()).offset as u32;
         let sym = Symbol::new(name, &elf_sym, reference);
         match self.symbols.entry(sym) {
             Entry::Occupied(mut s) => {
@@ -198,13 +186,15 @@ impl<'d> Writer<'d> {
         self.eh.e_phoff = 0;
         self.eh.e_phnum = 0;
 
-        let strtab_name = self.get_or_create_name(".strtab").0;
-        let symtab_name = self.get_or_create_name(".symtab").0;
+        let symtab_name = self.section_names.get_or_create(".symtab").offset;
+        let strtab_name = self.section_names.get_or_create(".strtab").offset;
+        let shstrtab_name = self.section_names.get_or_create(".shstrtab").offset;
 
-        // + 2 for string and symbol table section
-        self.eh.e_shnum = self.section_headers.len() as u16 + 2;
+        // + 3 for strings and symbol table section
+        self.eh.e_shnum = self.section_headers.len() as u16 + 3;
         let mut shoff = (size_of::<Header>()
-            + self.string_tab_len
+            + self.section_names.total_len()
+            + self.symbol_names.total_len()
             + self.symbols.values().flatten().count() * size_of::<Sym>())
             as u64;
         for sh in &self.section_headers {
@@ -245,7 +235,7 @@ impl<'d> Writer<'d> {
         }
         self.out.write_all(&buf).unwrap();
 
-        // add our string table section header
+        // add our symbol table section header
         self.section_headers.push(SectionHeader {
             sh_name: symtab_name as u32,
             sh_type: SHT_SYMTAB,
@@ -260,13 +250,13 @@ impl<'d> Writer<'d> {
         });
         file_offset += buf.len() as u64;
 
-        // write the string table to file
-        let mut names = self.names.into_iter().collect::<Vec<(_, usize)>>();
-        names.sort_by(|a, b| a.1.cmp(&b.1));
+        // write the symbol names to file
+        let names = self.symbol_names.sorted_names();
         for name in names {
             self.out.write_all(name.0.as_bytes()).unwrap();
             self.out.write_all(&[0]).unwrap();
         }
+        file_offset += self.symbol_names.total_len() as u64;
 
         // add our string table section header
         self.section_headers.push(SectionHeader {
@@ -275,7 +265,28 @@ impl<'d> Writer<'d> {
             sh_flags: 0,
             sh_addr: 0,
             sh_offset: file_offset,
-            sh_size: self.string_tab_len as u64,
+            sh_size: self.symbol_names.total_len() as u64,
+            sh_link: 0,
+            sh_info: 0,
+            sh_addralign: 0,
+            sh_entsize: 0,
+        });
+
+        // write the string table to file
+        let names = self.section_names.sorted_names();
+        for name in names {
+            self.out.write_all(name.0.as_bytes()).unwrap();
+            self.out.write_all(&[0]).unwrap();
+        }
+
+        // add our string table section header
+        self.section_headers.push(SectionHeader {
+            sh_name: shstrtab_name as u32,
+            sh_type: SHT_STRTAB,
+            sh_flags: 0,
+            sh_addr: 0,
+            sh_offset: file_offset,
+            sh_size: self.section_names.total_len() as u64,
             sh_link: 0,
             sh_info: 0,
             sh_addralign: 0,
