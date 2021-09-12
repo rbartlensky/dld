@@ -2,10 +2,7 @@ use crate::{error::ErrorType, serialize::Serialize, symbol::Symbol};
 use goblin::elf64::{
     header::{Header, ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64, ET_EXEC, EV_CURRENT},
     program_header::{ProgramHeader, PF_R, PF_X, PT_LOAD},
-    section_header::{
-        SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_NULL, SHT_PROGBITS,
-        SHT_STRTAB, SHT_SYMTAB,
-    },
+    section_header::{SectionHeader, SHT_NULL, SHT_STRTAB, SHT_SYMTAB},
     sym::{Sym, STB_LOCAL},
 };
 use std::{
@@ -92,7 +89,7 @@ impl<'d> Writer<'d> {
         entsize: u64,
         data: Option<Vec<u8>>,
         size: u64,
-    ) {
+    ) -> usize {
         // let ph = ProgramHeader {
         //     p_type: PT_LOAD,
         //     p_flags: PF_R | PF_X,
@@ -129,6 +126,7 @@ impl<'d> Writer<'d> {
             let sh = &mut self.section_headers[entry.index];
             sh.sh_size += size;
         }
+        entry.index
     }
 
     pub fn push_section(
@@ -136,7 +134,7 @@ impl<'d> Writer<'d> {
         name: String,
         section: &goblin::elf::SectionHeader,
         data: Option<&[u8]>,
-    ) {
+    ) -> usize {
         let data = data.map(|v| v.to_owned());
         self.add_section(
             name,
@@ -147,18 +145,20 @@ impl<'d> Writer<'d> {
             section.sh_entsize,
             data,
             section.sh_size,
-        );
+        )
     }
 
     pub fn add_symbol<'s>(
         &mut self,
         mut elf_sym: Sym,
+        new_shndx: usize,
         name: &'s str,
         reference: &'d Path,
     ) -> Result<(), ErrorType> {
         let name = name.to_string();
         elf_sym.st_name = self.symbol_names.get_or_create(name.clone()).offset as u32;
         let sym = Symbol::new(name, &elf_sym, reference);
+        elf_sym.st_shndx = new_shndx as u16;
         match self.symbols.entry(sym) {
             Entry::Occupied(mut s) => {
                 if s.key().is_global() {
@@ -179,6 +179,13 @@ impl<'d> Writer<'d> {
                 Ok(())
             }
         }
+    }
+
+    pub fn patch_section(&mut self, section: usize, offset: usize, value: u64) {
+        use byteorder::{LittleEndian, WriteBytesExt};
+
+        let mut slice = &mut self.sections.get_mut(&section).unwrap()[offset..offset + 8];
+        slice.write_u64::<LittleEndian>(value).unwrap();
     }
 
     pub fn write_to_disk(mut self) {
@@ -256,7 +263,6 @@ impl<'d> Writer<'d> {
             self.out.write_all(name.0.as_bytes()).unwrap();
             self.out.write_all(&[0]).unwrap();
         }
-        file_offset += self.symbol_names.total_len() as u64;
 
         // add our string table section header
         self.section_headers.push(SectionHeader {
@@ -271,6 +277,7 @@ impl<'d> Writer<'d> {
             sh_addralign: 0,
             sh_entsize: 0,
         });
+        file_offset += self.symbol_names.total_len() as u64;
 
         // write the string table to file
         let names = self.section_names.sorted_names();

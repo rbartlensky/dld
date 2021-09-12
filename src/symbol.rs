@@ -8,6 +8,7 @@ use goblin::elf64::sym::{Sym, STB_GLOBAL, STB_WEAK};
 #[derive(Debug, Eq)]
 pub struct Symbol<'r> {
     name: String,
+    old_shndx: u16,
     reference: &'r Path,
     is_global: bool,
     is_weak: bool,
@@ -16,7 +17,13 @@ pub struct Symbol<'r> {
 impl<'r> Symbol<'r> {
     pub fn new(name: String, sym: &Sym, reference: &'r Path) -> Self {
         let bind = sym.st_info >> 4;
-        Self { name, reference, is_global: bind == STB_GLOBAL, is_weak: bind == STB_WEAK }
+        Self {
+            name,
+            old_shndx: sym.st_shndx,
+            reference,
+            is_global: bind == STB_GLOBAL,
+            is_weak: bind == STB_WEAK,
+        }
     }
 
     pub const fn is_global(&self) -> bool {
