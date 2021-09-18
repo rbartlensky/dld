@@ -3,13 +3,15 @@ use goblin::elf64::{
     header::Header, program_header::ProgramHeader, section_header::SectionHeader, sym::Sym,
 };
 
-pub trait Serialize {
-    fn serialize(&self, buf: &mut Vec<u8>);
+use std::{io::Write, mem::size_of};
+
+pub trait Serialize<W: Write> {
+    fn serialize(&self, buf: &mut W) -> usize;
 }
 
-impl Serialize for Header {
-    fn serialize(&self, buf: &mut Vec<u8>) {
-        buf.extend(&self.e_ident);
+impl<W: Write> Serialize<W> for Header {
+    fn serialize(&self, buf: &mut W) -> usize {
+        buf.write_all(&self.e_ident).unwrap();
         buf.write_u16::<LittleEndian>(self.e_type).unwrap();
         buf.write_u16::<LittleEndian>(self.e_machine).unwrap();
         buf.write_u32::<LittleEndian>(self.e_version).unwrap();
@@ -23,11 +25,12 @@ impl Serialize for Header {
         buf.write_u16::<LittleEndian>(self.e_shentsize).unwrap();
         buf.write_u16::<LittleEndian>(self.e_shnum).unwrap();
         buf.write_u16::<LittleEndian>(self.e_shstrndx).unwrap();
+        size_of::<Header>()
     }
 }
 
-impl Serialize for ProgramHeader {
-    fn serialize(&self, buf: &mut Vec<u8>) {
+impl<W: Write> Serialize<W> for ProgramHeader {
+    fn serialize(&self, buf: &mut W) -> usize {
         buf.write_u32::<LittleEndian>(self.p_type).unwrap();
         buf.write_u32::<LittleEndian>(self.p_flags).unwrap();
         buf.write_u64::<LittleEndian>(self.p_offset).unwrap();
@@ -36,11 +39,12 @@ impl Serialize for ProgramHeader {
         buf.write_u64::<LittleEndian>(self.p_filesz).unwrap();
         buf.write_u64::<LittleEndian>(self.p_memsz).unwrap();
         buf.write_u64::<LittleEndian>(self.p_align).unwrap();
+        size_of::<ProgramHeader>()
     }
 }
 
-impl Serialize for SectionHeader {
-    fn serialize(&self, buf: &mut Vec<u8>) {
+impl<W: Write> Serialize<W> for SectionHeader {
+    fn serialize(&self, buf: &mut W) -> usize {
         buf.write_u32::<LittleEndian>(self.sh_name as u32).unwrap();
         buf.write_u32::<LittleEndian>(self.sh_type).unwrap();
         buf.write_u64::<LittleEndian>(self.sh_flags).unwrap();
@@ -51,16 +55,19 @@ impl Serialize for SectionHeader {
         buf.write_u32::<LittleEndian>(self.sh_info).unwrap();
         buf.write_u64::<LittleEndian>(self.sh_addralign).unwrap();
         buf.write_u64::<LittleEndian>(self.sh_entsize).unwrap();
+        // `sh_name` is a usize, but we always encode it as a u32
+        size_of::<SectionHeader>() - (size_of::<usize>() - size_of::<u32>())
     }
 }
 
-impl Serialize for Sym {
-    fn serialize(&self, buf: &mut Vec<u8>) {
+impl<W: Write> Serialize<W> for Sym {
+    fn serialize(&self, buf: &mut W) -> usize {
         buf.write_u32::<LittleEndian>(self.st_name).unwrap();
-        buf.push(self.st_info);
-        buf.push(self.st_other);
+        buf.write_u8(self.st_info).unwrap();
+        buf.write_u8(self.st_other).unwrap();
         buf.write_u16::<LittleEndian>(self.st_shndx).unwrap();
         buf.write_u64::<LittleEndian>(self.st_value).unwrap();
         buf.write_u64::<LittleEndian>(self.st_size).unwrap();
+        size_of::<Sym>()
     }
 }

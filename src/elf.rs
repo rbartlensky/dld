@@ -1,8 +1,10 @@
 use crate::{error::ErrorType, serialize::Serialize, symbol::Symbol};
 use goblin::elf64::{
     header::{Header, ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64, ET_EXEC, EV_CURRENT},
-    program_header::{ProgramHeader, PF_R, PF_X, PT_LOAD},
-    section_header::{SectionHeader, SHT_NULL, SHT_STRTAB, SHT_SYMTAB},
+    program_header::{ProgramHeader, PF_R, PF_W, PF_X, PT_LOAD},
+    section_header::{
+        SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NULL, SHT_STRTAB, SHT_SYMTAB,
+    },
     sym::{Sym, STB_LOCAL},
 };
 use std::{
@@ -24,7 +26,6 @@ pub struct Writer<'d> {
     section_names: StringTable,
     symbol_names: StringTable,
     symbols: HashMap<Symbol<'d>, Vec<Sym>>,
-    program_headers: Vec<ProgramHeader>,
     section_headers: Vec<SectionHeader>,
     sections: HashMap<usize, Vec<u8>>,
 }
@@ -55,12 +56,12 @@ impl<'d> Writer<'d> {
             e_machine: EM_X86_64,
             e_version: EV_CURRENT as u32,
             e_entry: 0x401000,
-            e_phoff: size_of::<Header>() as u64,
+            e_phoff: 0,
             e_shoff: (size_of::<Header>() + size_of::<ProgramHeader>()) as u64,
             e_flags: 0,
             e_ehsize: size_of::<Header>() as u16,
             e_phentsize: size_of::<ProgramHeader>() as u16,
-            e_phnum: 1,
+            e_phnum: 0,
             e_shentsize: size_of::<SectionHeader>() as u16,
             e_shnum: 1,
             e_shstrndx: 0,
@@ -71,7 +72,6 @@ impl<'d> Writer<'d> {
             section_names: Default::default(),
             symbol_names: Default::default(),
             symbols: Default::default(),
-            program_headers: vec![],
             section_headers: vec![],
             sections: Default::default(),
         };
@@ -90,17 +90,6 @@ impl<'d> Writer<'d> {
         data: Option<Vec<u8>>,
         size: u64,
     ) -> usize {
-        // let ph = ProgramHeader {
-        //     p_type: PT_LOAD,
-        //     p_flags: PF_R | PF_X,
-        //     p_offset: size_of::<Header>() as u64 + size_of::<ProgramHeader>() as u64,
-        //     p_vaddr: 0x401000,
-        //     p_paddr: 0,
-        //     p_filesz: text_code.len() as u64,
-        //     p_memsz: text_code.len() as u64,
-        //     p_align: 0,
-        // };
-
         let entry = self.section_names.get_or_create(name);
         let size = data.as_ref().map(|d| d.len() as u64).unwrap_or(size);
         if let Some(data) = data {
@@ -188,11 +177,14 @@ impl<'d> Writer<'d> {
         slice.write_u64::<LittleEndian>(value).unwrap();
     }
 
+    // elf header
+    // section 1
+    // section 2
+    // section header 1
+    // section header 2
+    // program header 1
+    // ...
     pub fn write_to_disk(mut self) {
-        // TODO: remove
-        self.eh.e_phoff = 0;
-        self.eh.e_phnum = 0;
-
         let symtab_name = self.section_names.get_or_create(".symtab").offset;
         let strtab_name = self.section_names.get_or_create(".strtab").offset;
         let shstrtab_name = self.section_names.get_or_create(".shstrtab").offset;
@@ -205,42 +197,65 @@ impl<'d> Writer<'d> {
             + self.symbols.values().flatten().count() * size_of::<Sym>())
             as u64;
         for sh in &self.section_headers {
-            if let Some(data) = self.sections.get(&(sh.sh_name as usize)) {
-                shoff += data.len() as u64;
+            let data_len =
+                self.sections.get(&(sh.sh_name as usize)).map(|v| v.len()).unwrap_or_default()
+                    as u64;
+            if sh.sh_flags as u32 & SHF_ALLOC == SHF_ALLOC {
+                self.eh.e_phnum += 1;
             }
+            shoff += data_len;
         }
         self.eh.e_shoff = shoff;
+        // the program header comes right after all the sections in our case
+        self.eh.e_phoff = shoff + (self.eh.e_shnum as usize * (size_of::<SectionHeader>() - 4)) as u64;
         // last section is the string table
         self.eh.e_shstrndx = self.eh.e_shnum - 1;
 
         // write the header out
-        let mut buf = Vec::with_capacity(size_of::<Header>());
-        self.eh.serialize(&mut buf);
-        self.out.write_all(&buf).unwrap();
+        self.eh.serialize(&mut self.out);
+
+        let mut program_headers = vec![];
+        let mut p_vaddr = 0x401000;
 
         // write all data to file
         let mut file_offset = size_of::<Header>() as u64;
         for sh in &mut self.section_headers {
             sh.sh_offset = file_offset;
-            if let Some(data) = self.sections.remove(&(sh.sh_name as usize)) {
+            let data = self.sections.remove(&(sh.sh_name as usize)).unwrap_or_default();
+            if sh.sh_flags as u32 & SHF_ALLOC == SHF_ALLOC {
+                let write = if sh.sh_flags as u32 & SHF_WRITE == SHF_WRITE { PF_W } else { 0 };
+                let exec =
+                    if sh.sh_flags as u32 & SHF_EXECINSTR == SHF_EXECINSTR { PF_X } else { 0 };
+                program_headers.push(ProgramHeader {
+                    p_type: PT_LOAD,
+                    p_flags: PF_R | write | exec,
+                    p_offset: file_offset,
+                    p_vaddr,
+                    p_paddr: 0,
+                    p_filesz: data.len() as u64,
+                    p_memsz: sh.sh_size,
+                    p_align: 0,
+                });
+                p_vaddr += sh.sh_size;
+            }
+            if !data.is_empty() {
                 self.out.write_all(&data).unwrap();
                 file_offset += data.len() as u64;
             }
         }
 
-        buf = Vec::with_capacity(size_of::<Sym>());
         // write the symbols
+        let mut section_len = 0;
         let mut syms: Vec<&Sym> = self.symbols.values().flatten().collect();
         syms.sort_by(|s1, s2| (s1.st_info >> 4).cmp(&(s2.st_info >> 4)));
         let mut last_local = 0;
         for sym in syms {
-            sym.serialize(&mut buf);
+            section_len += sym.serialize(&mut self.out);
             let st_bind = sym.st_info >> 4;
             if st_bind == STB_LOCAL {
                 last_local += 1;
             }
         }
-        self.out.write_all(&buf).unwrap();
 
         // add our symbol table section header
         self.section_headers.push(SectionHeader {
@@ -249,13 +264,13 @@ impl<'d> Writer<'d> {
             sh_flags: 0,
             sh_addr: 0,
             sh_offset: file_offset,
-            sh_size: buf.len() as u64,
+            sh_size: section_len as u64,
             sh_link: self.section_headers.len() as u32 + 1,
             sh_info: last_local,
             sh_addralign: 0,
             sh_entsize: size_of::<Sym>() as u64,
         });
-        file_offset += buf.len() as u64;
+        file_offset += section_len as u64;
 
         // write the symbol names to file
         let names = self.symbol_names.sorted_names();
@@ -264,7 +279,7 @@ impl<'d> Writer<'d> {
             self.out.write_all(&[0]).unwrap();
         }
 
-        // add our string table section header
+        // add our symbol string table section header
         self.section_headers.push(SectionHeader {
             sh_name: strtab_name as u32,
             sh_type: SHT_STRTAB,
@@ -301,10 +316,13 @@ impl<'d> Writer<'d> {
         });
 
         // write section headers to disk
-        buf = Vec::with_capacity(size_of::<SectionHeader>());
         for sh in self.section_headers {
-            sh.serialize(&mut buf);
+            sh.serialize(&mut self.out);
         }
-        self.out.write_all(&buf).unwrap();
+
+        // write program headers to disk
+        for ph in program_headers {
+            ph.serialize(&mut self.out);
+        }
     }
 }
