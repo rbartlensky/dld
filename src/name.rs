@@ -1,4 +1,7 @@
-use std::{hash::{Hash, Hasher}, ops::Deref};
+use std::{
+    hash::{Hash, Hasher},
+    ops::Deref,
+};
 
 #[derive(Clone, Debug, Eq)]
 pub enum Name {

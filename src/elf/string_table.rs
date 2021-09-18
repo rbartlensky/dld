@@ -41,7 +41,7 @@ impl StringTable {
             .names
             .iter()
             // wish I could use `.cloned`
-            .map(|v| (v.0.clone(), (v.1.0, v.1.1)))
+            .map(|v| (v.0.clone(), (v.1 .0, v.1 .1)))
             .collect::<Vec<(_, (usize, usize))>>();
         names.sort_by(|a, b| a.1 .1.cmp(&b.1 .1));
         names
