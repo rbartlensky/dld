@@ -79,6 +79,8 @@ impl<'d> Writer<'d> {
         Ok(s)
     }
 
+    // TODO:
+    #[allow(clippy::too_many_arguments)]
     fn add_section(
         &mut self,
         name: impl Into<Name>,

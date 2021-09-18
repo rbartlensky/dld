@@ -38,8 +38,8 @@ impl<'r> Symbol<'r> {
         &self.name
     }
 
-    pub fn reference(&self) -> &Path {
-        &self.reference
+    pub const fn reference(&self) -> &Path {
+        self.reference
     }
 }
 
