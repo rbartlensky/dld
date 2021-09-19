@@ -18,7 +18,7 @@ use std::{
 use crate::name::Name;
 
 mod string_table;
-use string_table::StringTable;
+pub use string_table::StringTable;
 
 pub struct Writer<'d> {
     out: File,
@@ -208,18 +208,16 @@ impl<'d> Writer<'d> {
             shoff += data_len;
         }
         self.eh.e_shoff = shoff;
-        // the program header comes right after all the sections in our case
+        // the program header comes right after all the sections + headers
         self.eh.e_phoff = shoff + (self.eh.e_shnum as usize * size_of::<SectionHeader>()) as u64;
-        // last section is the string table
+        // last section is the section header string table
         self.eh.e_shstrndx = self.eh.e_shnum - 1;
 
-        // write the header out
         self.eh.serialize(&mut self.out);
 
         let mut program_headers = vec![];
-        let mut p_vaddr = 0x401000;
-
-        // write all data to file
+        let mut p_vaddr = self.eh.e_entry;
+        // write all section data to file
         let mut file_offset = size_of::<Header>() as u64;
         for sh in &mut self.section_headers {
             sh.sh_offset = file_offset;
@@ -246,7 +244,7 @@ impl<'d> Writer<'d> {
             }
         }
 
-        // write the symbols
+        // write the symbols to disk and make sure that locals come first
         let mut section_len = 0;
         let mut syms: Vec<&Sym> = self.symbols.values().flatten().collect();
         syms.sort_by(|s1, s2| (s1.st_info >> 4).cmp(&(s2.st_info >> 4)));
@@ -274,11 +272,9 @@ impl<'d> Writer<'d> {
         });
         file_offset += section_len as u64;
 
-        // write the symbol names to file
         let names = self.symbol_names.sorted_names();
-        for name in names {
-            self.out.write_all(name.0.as_bytes()).unwrap();
-            self.out.write_all(&[0]).unwrap();
+        for (name, _) in names {
+            name.serialize(&mut self.out);
         }
 
         // add our symbol string table section header
@@ -298,9 +294,8 @@ impl<'d> Writer<'d> {
 
         // write the string table to file
         let names = self.section_names.sorted_names();
-        for name in names {
-            self.out.write_all(name.0.as_bytes()).unwrap();
-            self.out.write_all(&[0]).unwrap();
+        for (name, _) in names {
+            name.serialize(&mut self.out);
         }
 
         // add our string table section header
@@ -317,14 +312,7 @@ impl<'d> Writer<'d> {
             sh_entsize: 0,
         });
 
-        // write section headers to disk
-        for sh in self.section_headers {
-            sh.serialize(&mut self.out);
-        }
-
-        // write program headers to disk
-        for ph in program_headers {
-            ph.serialize(&mut self.out);
-        }
+        self.section_headers.serialize(&mut self.out);
+        program_headers.serialize(&mut self.out);
     }
 }

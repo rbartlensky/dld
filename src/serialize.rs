@@ -5,6 +5,8 @@ use goblin::elf64::{
 
 use std::{io::Write, mem::size_of};
 
+use crate::name::Name;
+
 pub trait Serialize<W: Write> {
     fn serialize(&self, buf: &mut W) -> usize;
 }
@@ -68,5 +70,23 @@ impl<W: Write> Serialize<W> for Sym {
         buf.write_u64::<LittleEndian>(self.st_value).unwrap();
         buf.write_u64::<LittleEndian>(self.st_size).unwrap();
         size_of::<Sym>()
+    }
+}
+
+impl<W: Write> Serialize<W> for Name {
+    fn serialize(&self, buf: &mut W) -> usize {
+        buf.write_all(self.as_bytes()).unwrap();
+        buf.write_u8(0).unwrap();
+        self.as_bytes().len() + 1
+    }
+}
+
+impl<W: Write, S: Serialize<W>> Serialize<W> for Vec<S> {
+    fn serialize(&self, buf: &mut W) -> usize {
+        let mut written = 0;
+        for v in self {
+            written += v.serialize(buf);
+        }
+        written
     }
 }
