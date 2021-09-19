@@ -55,8 +55,7 @@ impl<W: Write> Serialize<W> for SectionHeader {
         buf.write_u32::<LittleEndian>(self.sh_info).unwrap();
         buf.write_u64::<LittleEndian>(self.sh_addralign).unwrap();
         buf.write_u64::<LittleEndian>(self.sh_entsize).unwrap();
-        // `sh_name` is a usize, but we always encode it as a u32
-        size_of::<SectionHeader>() - (size_of::<usize>() - size_of::<u32>())
+        size_of::<SectionHeader>()
     }
 }
 

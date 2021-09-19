@@ -209,8 +209,7 @@ impl<'d> Writer<'d> {
         }
         self.eh.e_shoff = shoff;
         // the program header comes right after all the sections in our case
-        self.eh.e_phoff =
-            shoff + (self.eh.e_shnum as usize * (size_of::<SectionHeader>() - 4)) as u64;
+        self.eh.e_phoff = shoff + (self.eh.e_shnum as usize * size_of::<SectionHeader>()) as u64;
         // last section is the string table
         self.eh.e_shstrndx = self.eh.e_shnum - 1;
 
