@@ -3,7 +3,8 @@ use goblin::elf64::{
     header::{Header, ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64, ET_EXEC, EV_CURRENT},
     program_header::{ProgramHeader, PF_R, PF_W, PF_X, PT_LOAD},
     section_header::{
-        SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NULL, SHT_STRTAB, SHT_SYMTAB,
+        SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_UNDEF,
+        SHT_NULL, SHT_STRTAB, SHT_SYMTAB,
     },
     sym::{Sym, STB_LOCAL},
 };
@@ -150,6 +151,16 @@ impl<'d> Writer<'d> {
         elf_sym.st_name = self.symbol_names.get_or_create(name.clone()).offset as u32;
         let sym = Symbol::new(name, &elf_sym, reference);
         elf_sym.st_shndx = new_shndx as u16;
+        match new_shndx as u32 {
+            // TODO: handle
+            SHN_ABS | SHN_COMMON | SHN_UNDEF => {}
+            _ => {
+                // patch the symbol's value accordingly
+                elf_sym.st_value +=
+                    self.sections.get(&new_shndx).map(|v| v.len()).unwrap_or_default() as u64
+            }
+        }
+
         match self.symbols.entry(sym) {
             Entry::Occupied(mut s) => {
                 if s.key().is_global() {
@@ -215,7 +226,7 @@ impl<'d> Writer<'d> {
 
         self.eh.serialize(&mut self.out);
 
-        let mut program_headers = vec![];
+        let mut program_headers = Vec::with_capacity(self.eh.e_phnum as usize);
         let mut p_vaddr = self.eh.e_entry;
         // write all section data to file
         let mut file_offset = size_of::<Header>() as u64;
