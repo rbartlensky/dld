@@ -27,25 +27,19 @@ pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>
                 [SHT_PROGBITS, SHT_HASH, SHT_DYNAMIC, SHT_NOTE].contains(&sh.sh_type)
             }) {
                 let name = get_section_name(&elf, section.sh_name).map_path_err(input)?;
-                let new_index = writer.push_section(
+                let res = writer.push_section(
                     name.into(),
                     section,
                     section.file_range().map(|r| &buf[r]),
                 );
-                section_relocations.insert(i, new_index);
+                section_relocations.insert(i, res);
             }
             for symbol in &elf.syms {
                 let name = get_symbol_name(&elf, symbol.st_name).map_path_err(input)?;
-                writer
-                    .add_symbol(
-                        symbol.into(),
-                        *section_relocations
-                            .get(&(symbol.st_shndx as usize))
-                            .unwrap_or(&(symbol.st_shndx as usize)),
-                        name,
-                        input,
-                    )
-                    .map_path_err(input)?;
+                let sec_ref = *section_relocations.get(&(symbol.st_shndx as usize)).unwrap_or(
+                    &elf::SectionRef { index: symbol.st_shndx as usize, insertion_point: 0 },
+                );
+                writer.add_symbol(symbol.into(), sec_ref, name, input).map_path_err(input)?;
             }
             for (_, rels) in elf.shdr_relocs {
                 for rel in rels.iter().filter(|r| r.r_sym != 0) {
@@ -65,7 +59,7 @@ pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>
                         x => unimplemented!("Relocation {}", x),
                     };
                     writer.patch_section(
-                        section_relocations[&(symbol.st_shndx as usize)],
+                        section_relocations[&(symbol.st_shndx as usize)].index,
                         rel.r_offset as usize,
                         value,
                     );

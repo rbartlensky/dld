@@ -6,9 +6,10 @@ use goblin::elf64::{
         SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_UNDEF,
         SHT_NULL, SHT_STRTAB, SHT_SYMTAB,
     },
-    sym::{Sym, STB_LOCAL},
+    sym::{Sym, STB_LOCAL, STT_NOTYPE},
 };
 use std::{
+    cmp::Ordering,
     collections::{hash_map::Entry, HashMap},
     fs::File,
     io::Write,
@@ -20,6 +21,15 @@ use crate::name::Name;
 
 mod string_table;
 pub use string_table::StringTable;
+
+#[derive(Clone, Copy)]
+pub struct SectionRef {
+    /// The section index where a particular section was relocated to.
+    pub index: usize,
+    /// The byte offset at which a particular section was relocated to, relative
+    /// to the start of the section of `index`.
+    pub insertion_point: usize,
+}
 
 pub struct Writer<'d> {
     out: File,
@@ -77,6 +87,20 @@ impl<'d> Writer<'d> {
             sections: Default::default(),
         };
         s.add_section("", SHT_NULL, 0, 0, 0, 0, None, 0);
+        s.add_symbol_inner(
+            Sym {
+                st_name: 0,
+                st_info: 0,
+                st_other: 0,
+                st_shndx: SHN_UNDEF as u16,
+                st_value: 0,
+                st_size: 0,
+            },
+            SectionRef { index: SHN_UNDEF as usize, insertion_point: 0 },
+            "",
+            Path::new(""),
+        )
+        .unwrap();
         Ok(s)
     }
 
@@ -92,13 +116,13 @@ impl<'d> Writer<'d> {
         entsize: u64,
         data: Option<Vec<u8>>,
         size: u64,
-    ) -> usize {
+    ) -> SectionRef {
         let entry = self.section_names.get_or_create(name);
         let size = data.as_ref().map(|d| d.len() as u64).unwrap_or(size);
         if let Some(data) = data {
             self.sections.entry(entry.index).and_modify(|v| v.extend(&data)).or_insert(data);
         }
-        if entry.new {
+        let old_size = if entry.new {
             let sh = SectionHeader {
                 sh_name: entry.offset as u32,
                 sh_type: kind,
@@ -114,11 +138,14 @@ impl<'d> Writer<'d> {
                 sh_entsize: entsize,
             };
             self.section_headers.push(sh);
+            0
         } else {
             let sh = &mut self.section_headers[entry.index];
+            let old_size = sh.sh_size;
             sh.sh_size += size;
-        }
-        entry.index
+            old_size as usize
+        };
+        SectionRef { index: entry.index, insertion_point: old_size }
     }
 
     pub fn push_section(
@@ -126,7 +153,7 @@ impl<'d> Writer<'d> {
         name: String,
         section: &goblin::elf::SectionHeader,
         data: Option<&[u8]>,
-    ) -> usize {
+    ) -> SectionRef {
         let data = data.map(|v| v.to_owned());
         self.add_section(
             name,
@@ -140,24 +167,22 @@ impl<'d> Writer<'d> {
         )
     }
 
-    pub fn add_symbol<'s>(
+    fn add_symbol_inner<'s>(
         &mut self,
         mut elf_sym: Sym,
-        new_shndx: usize,
+        sec_ref: SectionRef,
         name: &'s str,
         reference: &'d Path,
     ) -> Result<(), ErrorType> {
         let name = name.to_string();
         elf_sym.st_name = self.symbol_names.get_or_create(name.clone()).offset as u32;
         let sym = Symbol::new(name, &elf_sym, reference);
-        elf_sym.st_shndx = new_shndx as u16;
-        match new_shndx as u32 {
+        elf_sym.st_shndx = sec_ref.index as u16;
+        match sec_ref.index as u32 {
             // TODO: handle
             SHN_ABS | SHN_COMMON | SHN_UNDEF => {}
             _ => {
-                // patch the symbol's value accordingly
-                elf_sym.st_value +=
-                    self.sections.get(&new_shndx).map(|v| v.len()).unwrap_or_default() as u64
+                elf_sym.st_value += sec_ref.insertion_point as u64;
             }
         }
 
@@ -181,6 +206,20 @@ impl<'d> Writer<'d> {
                 Ok(())
             }
         }
+    }
+
+    pub fn add_symbol<'s>(
+        &mut self,
+        elf_sym: Sym,
+        sec_ref: SectionRef,
+        name: &'s str,
+        reference: &'d Path,
+    ) -> Result<(), ErrorType> {
+        // ignore undef notypes
+        if sec_ref.index as u32 == SHN_UNDEF && st_type(elf_sym.st_info) == STT_NOTYPE {
+            return Ok(());
+        }
+        self.add_symbol_inner(elf_sym, sec_ref, name, reference)
     }
 
     pub fn patch_section(&mut self, section: usize, offset: usize, value: u64) {
@@ -258,7 +297,7 @@ impl<'d> Writer<'d> {
         // write the symbols to disk and make sure that locals come first
         let mut section_len = 0;
         let mut syms: Vec<&Sym> = self.symbols.values().flatten().collect();
-        syms.sort_by(|s1, s2| (s1.st_info >> 4).cmp(&(s2.st_info >> 4)));
+        syms.sort_by(|s1, s2| sort_symbols_func(s1, s2));
         let mut last_local = 0;
         for sym in syms {
             section_len += sym.serialize(&mut self.out);
@@ -325,5 +364,25 @@ impl<'d> Writer<'d> {
 
         self.section_headers.serialize(&mut self.out);
         program_headers.serialize(&mut self.out);
+    }
+}
+
+fn st_type(st_info: u8) -> u8 {
+    st_info & 0xf
+}
+
+fn st_bind(st_info: u8) -> u8 {
+    st_info >> 4
+}
+
+// local before global, notype before other types
+fn sort_symbols_func(s1: &Sym, s2: &Sym) -> Ordering {
+    let b1 = st_bind(s1.st_info);
+    let b2 = st_bind(s2.st_info);
+    let t1 = st_type(s1.st_info);
+    let t2 = st_type(s2.st_info);
+    match b1.cmp(&b2) {
+        Ordering::Equal => t1.cmp(&t2),
+        c => c,
     }
 }
