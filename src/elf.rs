@@ -265,11 +265,12 @@ impl<'d> Writer<'d> {
 
         self.eh.serialize(&mut self.out);
 
+        let mut section_to_program_header = HashMap::with_capacity(self.eh.e_phnum as usize);
         let mut program_headers = Vec::with_capacity(self.eh.e_phnum as usize);
         let mut p_vaddr = self.eh.e_entry;
         // write all section data to file
         let mut file_offset = size_of::<Header>() as u64;
-        for sh in &mut self.section_headers {
+        for (shndx, sh) in &mut self.section_headers.iter_mut().enumerate() {
             sh.sh_offset = file_offset;
             let data = self.sections.remove(&(sh.sh_name as usize)).unwrap_or_default();
             if sh.sh_flags as u32 & SHF_ALLOC == SHF_ALLOC {
@@ -286,6 +287,7 @@ impl<'d> Writer<'d> {
                     p_memsz: sh.sh_size,
                     p_align: 0,
                 });
+                section_to_program_header.insert(shndx, p_vaddr);
                 p_vaddr += sh.sh_size;
             }
             if !data.is_empty() {
@@ -296,10 +298,11 @@ impl<'d> Writer<'d> {
 
         // write the symbols to disk and make sure that locals come first
         let mut section_len = 0;
-        let mut syms: Vec<&Sym> = self.symbols.values().flatten().collect();
+        let mut syms: Vec<Sym> = self.symbols.into_values().flatten().collect();
         syms.sort_by(|s1, s2| sort_symbols_func(s1, s2));
         let mut last_local = 0;
-        for sym in syms {
+        for mut sym in syms {
+            sym.st_value += section_to_program_header.get(&(sym.st_shndx as usize)).unwrap_or(&0);
             section_len += sym.serialize(&mut self.out);
             let st_bind = sym.st_info >> 4;
             if st_bind == STB_LOCAL {
