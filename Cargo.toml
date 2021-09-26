@@ -8,6 +8,10 @@ edition = "2018"
 
 [dependencies]
 byteorder = "1.4.3"
-goblin = "0.4.2"
+# would be nice to get rid of elf32: https://github.com/m4b/goblin/issues/212
+goblin = { version = "0.4", features = ["elf32", "elf64", "endian_fd", "std"], default-features = false }
 pico-args = "0.4"
 thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3"
