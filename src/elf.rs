@@ -1,4 +1,4 @@
-use crate::{error::ErrorType, serialize::Serialize, symbol::Symbol};
+use crate::{error::ErrorType, name::Name, serialize::Serialize, symbol::Symbol};
 use goblin::elf64::{
     header::{Header, ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64, ET_EXEC, EV_CURRENT},
     program_header::{ProgramHeader, PF_R, PF_W, PF_X, PT_LOAD},
@@ -17,8 +17,6 @@ use std::{
     path::Path,
 };
 
-use crate::name::Name;
-
 mod string_table;
 pub use string_table::StringTable;
 
@@ -33,17 +31,23 @@ pub struct SectionRef {
     pub insertion_point: usize,
 }
 
-pub struct Section {
+struct Section {
+    /// The section header of the section.
     sh: SectionHeader,
+    /// In case we load this section into memory, we will also have an
+    /// associated program header.
     ph: Option<ProgramHeader>,
+    /// The data of the section.
     data: Vec<u8>,
 }
 
 impl Section {
+    /// Returns the size of the data, rounded to the next multiple of `PAGE_SIZE`.
     pub fn data_size(&self) -> u64 {
         round_to(self.data.len() as u64, PAGE_SIZE)
     }
 
+    /// Extends the data, such that the length becomes a multiple of `PAGE_SIZE`.
     pub fn align_and_extend_data(&mut self) {
         self.data.extend(std::iter::repeat(0).take(self.data_size() as usize - self.data.len()));
     }
@@ -79,8 +83,6 @@ impl<'d> Writer<'d> {
             e_machine: EM_X86_64,
             e_version: EV_CURRENT as u32,
             e_entry: 0x401000,
-            e_phoff: 0,
-            e_shoff: 0,
             e_flags: 0,
             e_ehsize: size_of::<Header>() as u16,
             e_phentsize: size_of::<ProgramHeader>() as u16,
@@ -88,6 +90,9 @@ impl<'d> Writer<'d> {
             e_shentsize: size_of::<SectionHeader>() as u16,
             // we have the the null section initially
             e_shnum: 1,
+            // patched in `Writer::write`
+            e_phoff: 0,
+            e_shoff: 0,
             e_shstrndx: 0,
         };
         let mut s = Self {
@@ -174,7 +179,6 @@ impl<'d> Writer<'d> {
                 elf_sym.st_value += sec_ref.insertion_point as u64;
             }
         }
-
         match self.symbols.entry(sym) {
             Entry::Occupied(mut s) => {
                 if s.key().is_global() {
@@ -246,7 +250,6 @@ impl<'d> Writer<'d> {
         self.eh.e_phoff = shoff + (self.eh.e_shnum as usize * size_of::<SectionHeader>()) as u64;
         // last section is the section header string table
         self.eh.e_shstrndx = self.eh.e_shnum - 1;
-
         self.eh.serialize(&mut self.out);
 
         let mut p_vaddr = self.eh.e_entry;
@@ -342,7 +345,7 @@ impl<'d> Writer<'d> {
         for section in &self.sections {
             section.sh.serialize(&mut self.out);
         }
-        for section in &self.sections {
+        for section in self.sections {
             if let Some(ph) = section.ph {
                 ph.serialize(&mut self.out);
             }
