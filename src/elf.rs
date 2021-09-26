@@ -22,6 +22,8 @@ use crate::name::Name;
 mod string_table;
 pub use string_table::StringTable;
 
+const PAGE_SIZE: u64 = 0x1000;
+
 #[derive(Clone, Copy)]
 pub struct SectionRef {
     /// The section index where a particular section was relocated to.
@@ -31,49 +33,60 @@ pub struct SectionRef {
     pub insertion_point: usize,
 }
 
+pub struct Section {
+    sh: SectionHeader,
+    ph: Option<ProgramHeader>,
+    data: Vec<u8>,
+}
+
+impl Section {
+    pub fn data_size(&self) -> u64 {
+        round_to(self.data.len() as u64, PAGE_SIZE)
+    }
+
+    pub fn align_and_extend_data(&mut self) {
+        self.data.extend(std::iter::repeat(0).take(self.data_size() as usize - self.data.len()));
+    }
+}
+
+impl From<SectionHeader> for Section {
+    fn from(sh: SectionHeader) -> Self {
+        Self { sh, ph: None, data: vec![] }
+    }
+}
+
 pub struct Writer<'d> {
     out: File,
     eh: Header,
     section_names: StringTable,
     symbol_names: StringTable,
     symbols: HashMap<Symbol<'d>, Vec<Sym>>,
-    section_headers: Vec<SectionHeader>,
-    sections: HashMap<usize, Vec<u8>>,
+    sections: Vec<Section>,
 }
 
 impl<'d> Writer<'d> {
     pub fn new(output: &Path) -> std::io::Result<Self> {
         let out = File::create(output)?;
         let eh = Header {
+            #[rustfmt::skip]
             e_ident: [
-                ELFMAG[0],
-                ELFMAG[1],
-                ELFMAG[2],
-                ELFMAG[3],
-                ELFCLASS64,
-                ELFDATA2LSB,
-                EV_CURRENT,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
+                ELFMAG[0], ELFMAG[1], ELFMAG[2], ELFMAG[3],
+                ELFCLASS64, ELFDATA2LSB, EV_CURRENT, 0,
+                0, 0, 0, 0,
+                0, 0, 0, 0,
             ],
             e_type: ET_EXEC,
             e_machine: EM_X86_64,
             e_version: EV_CURRENT as u32,
             e_entry: 0x401000,
             e_phoff: 0,
-            e_shoff: (size_of::<Header>() + size_of::<ProgramHeader>()) as u64,
+            e_shoff: 0,
             e_flags: 0,
             e_ehsize: size_of::<Header>() as u16,
             e_phentsize: size_of::<ProgramHeader>() as u16,
             e_phnum: 0,
             e_shentsize: size_of::<SectionHeader>() as u16,
+            // we have the the null section initially
             e_shnum: 1,
             e_shstrndx: 0,
         };
@@ -83,19 +96,12 @@ impl<'d> Writer<'d> {
             section_names: Default::default(),
             symbol_names: Default::default(),
             symbols: Default::default(),
-            section_headers: vec![],
             sections: Default::default(),
         };
-        s.add_section("", SHT_NULL, 0, 0, 0, 0, None, 0);
+        let null_section = goblin::elf::SectionHeader { sh_type: SHT_NULL, ..Default::default() };
+        s.add_section("", &null_section, None);
         s.add_symbol_inner(
-            Sym {
-                st_name: 0,
-                st_info: 0,
-                st_other: 0,
-                st_shndx: SHN_UNDEF as u16,
-                st_value: 0,
-                st_size: 0,
-            },
+            Sym { st_shndx: SHN_UNDEF as u16, ..Default::default() },
             SectionRef { index: SHN_UNDEF as usize, insertion_point: 0 },
             "",
             Path::new(""),
@@ -104,45 +110,37 @@ impl<'d> Writer<'d> {
         Ok(s)
     }
 
-    // TODO:
-    #[allow(clippy::too_many_arguments)]
     fn add_section(
         &mut self,
         name: impl Into<Name>,
-        kind: u32,
-        flags: u32,
-        link: u32,
-        info: u32,
-        entsize: u64,
+        sh: &goblin::elf::SectionHeader,
         data: Option<Vec<u8>>,
-        size: u64,
     ) -> SectionRef {
         let entry = self.section_names.get_or_create(name);
-        let size = data.as_ref().map(|d| d.len() as u64).unwrap_or(size);
-        if let Some(data) = data {
-            self.sections.entry(entry.index).and_modify(|v| v.extend(&data)).or_insert(data);
-        }
         let old_size = if entry.new {
             let sh = SectionHeader {
                 sh_name: entry.offset as u32,
-                sh_type: kind,
-                sh_flags: flags as u64,
+                sh_type: sh.sh_type,
+                sh_flags: sh.sh_flags as u64,
+                sh_size: sh.sh_size,
+                sh_link: sh.sh_link,
+                sh_info: sh.sh_info,
+                sh_entsize: sh.sh_entsize,
                 // patched later on
                 sh_addr: 0,
-                // patched later on
                 sh_offset: 0,
-                sh_size: size,
-                sh_link: link,
-                sh_info: info,
                 sh_addralign: 0,
-                sh_entsize: entsize,
             };
-            self.section_headers.push(sh);
+            let ph = get_program_header(&sh);
+            self.sections.push(Section { sh, ph, data: data.unwrap_or_default() });
             0
         } else {
-            let sh = &mut self.section_headers[entry.index];
-            let old_size = sh.sh_size;
-            sh.sh_size += size;
+            let section = &mut self.sections[entry.index];
+            let old_size = section.data.len();
+            section.sh.sh_size += sh.sh_size;
+            if let Some(v) = data {
+                section.data.extend(v)
+            }
             old_size as usize
         };
         SectionRef { index: entry.index, insertion_point: old_size }
@@ -155,16 +153,7 @@ impl<'d> Writer<'d> {
         data: Option<&[u8]>,
     ) -> SectionRef {
         let data = data.map(|v| v.to_owned());
-        self.add_section(
-            name,
-            section.sh_type,
-            section.sh_flags as u32,
-            section.sh_link,
-            section.sh_info,
-            section.sh_entsize,
-            data,
-            section.sh_size,
-        )
+        self.add_section(name, section, data)
     }
 
     fn add_symbol_inner<'s>(
@@ -225,7 +214,7 @@ impl<'d> Writer<'d> {
     pub fn patch_section(&mut self, section: usize, offset: usize, value: u64) {
         use byteorder::{LittleEndian, WriteBytesExt};
 
-        let mut slice = &mut self.sections.get_mut(&section).unwrap()[offset..offset + 8];
+        let mut slice = &mut self.sections[section].data[offset..offset + 8];
         slice.write_u64::<LittleEndian>(value).unwrap();
     }
 
@@ -242,20 +231,15 @@ impl<'d> Writer<'d> {
         let shstrtab_name = self.section_names.get_or_create(".shstrtab").offset;
 
         // + 3 for strings and symbol table section
-        self.eh.e_shnum = self.section_headers.len() as u16 + 3;
+        self.eh.e_shnum = self.sections.len() as u16 + 3;
         let mut shoff = (size_of::<Header>()
             + self.section_names.total_len()
             + self.symbol_names.total_len()
             + self.symbols.values().flatten().count() * size_of::<Sym>())
             as u64;
-        for sh in &self.section_headers {
-            let data_len =
-                self.sections.get(&(sh.sh_name as usize)).map(|v| v.len()).unwrap_or_default()
-                    as u64;
-            if sh.sh_flags as u32 & SHF_ALLOC == SHF_ALLOC {
-                self.eh.e_phnum += 1;
-            }
-            shoff += data_len;
+        for section in &mut self.sections {
+            shoff += section.data_size();
+            self.eh.e_phnum += section.ph.map(|_| 1).unwrap_or_default();
         }
         self.eh.e_shoff = shoff;
         // the program header comes right after all the sections + headers
@@ -265,34 +249,26 @@ impl<'d> Writer<'d> {
 
         self.eh.serialize(&mut self.out);
 
-        let mut section_to_program_header = HashMap::with_capacity(self.eh.e_phnum as usize);
-        let mut program_headers = Vec::with_capacity(self.eh.e_phnum as usize);
         let mut p_vaddr = self.eh.e_entry;
-        // write all section data to file
+        // write all section data to file, and patch section and program headers
         let mut file_offset = size_of::<Header>() as u64;
-        for (shndx, sh) in &mut self.section_headers.iter_mut().enumerate() {
-            sh.sh_offset = file_offset;
-            let data = self.sections.remove(&(sh.sh_name as usize)).unwrap_or_default();
-            if sh.sh_flags as u32 & SHF_ALLOC == SHF_ALLOC {
-                let write = if sh.sh_flags as u32 & SHF_WRITE == SHF_WRITE { PF_W } else { 0 };
-                let exec =
-                    if sh.sh_flags as u32 & SHF_EXECINSTR == SHF_EXECINSTR { PF_X } else { 0 };
-                program_headers.push(ProgramHeader {
-                    p_type: PT_LOAD,
-                    p_flags: PF_R | write | exec,
-                    p_offset: file_offset,
-                    p_vaddr,
-                    p_paddr: 0,
-                    p_filesz: data.len() as u64,
-                    p_memsz: sh.sh_size,
-                    p_align: 0,
-                });
-                section_to_program_header.insert(shndx, p_vaddr);
-                p_vaddr += sh.sh_size;
+        for section in &mut self.sections {
+            section.sh.sh_offset = file_offset;
+            if let Some(ph) = &mut section.ph {
+                section.sh.sh_addr = p_vaddr;
+                section.sh.sh_addralign = PAGE_SIZE;
+                ph.p_offset = file_offset;
+                ph.p_vaddr = p_vaddr;
+                ph.p_paddr = p_vaddr;
+                ph.p_filesz = section.sh.sh_size;
+                ph.p_memsz = section.sh.sh_size;
+                p_vaddr += round_to(section.sh.sh_size, PAGE_SIZE);
             }
-            if !data.is_empty() {
-                self.out.write_all(&data).unwrap();
-                file_offset += data.len() as u64;
+            if !section.data.is_empty() {
+                section.align_and_extend_data();
+                self.out.write_all(&section.data).unwrap();
+                file_offset += section.data.len() as u64;
+                section.data.clear();
             }
         }
 
@@ -302,7 +278,8 @@ impl<'d> Writer<'d> {
         syms.sort_by(|s1, s2| sort_symbols_func(s1, s2));
         let mut last_local = 0;
         for mut sym in syms {
-            sym.st_value += section_to_program_header.get(&(sym.st_shndx as usize)).unwrap_or(&0);
+            sym.st_value +=
+                self.sections.get(sym.st_shndx as usize).map(|s| s.sh.sh_addr).unwrap_or(0);
             section_len += sym.serialize(&mut self.out);
             let st_bind = sym.st_info >> 4;
             if st_bind == STB_LOCAL {
@@ -311,18 +288,19 @@ impl<'d> Writer<'d> {
         }
 
         // add our symbol table section header
-        self.section_headers.push(SectionHeader {
-            sh_name: symtab_name as u32,
-            sh_type: SHT_SYMTAB,
-            sh_flags: 0,
-            sh_addr: 0,
-            sh_offset: file_offset,
-            sh_size: section_len as u64,
-            sh_link: self.section_headers.len() as u32 + 1,
-            sh_info: last_local,
-            sh_addralign: 0,
-            sh_entsize: size_of::<Sym>() as u64,
-        });
+        self.sections.push(
+            SectionHeader {
+                sh_name: symtab_name as u32,
+                sh_type: SHT_SYMTAB,
+                sh_offset: file_offset,
+                sh_size: section_len as u64,
+                sh_link: self.sections.len() as u32 + 1,
+                sh_info: last_local,
+                sh_entsize: size_of::<Sym>() as u64,
+                ..Default::default()
+            }
+            .into(),
+        );
         file_offset += section_len as u64;
 
         let names = self.symbol_names.sorted_names();
@@ -331,18 +309,16 @@ impl<'d> Writer<'d> {
         }
 
         // add our symbol string table section header
-        self.section_headers.push(SectionHeader {
-            sh_name: strtab_name as u32,
-            sh_type: SHT_STRTAB,
-            sh_flags: 0,
-            sh_addr: 0,
-            sh_offset: file_offset,
-            sh_size: self.symbol_names.total_len() as u64,
-            sh_link: 0,
-            sh_info: 0,
-            sh_addralign: 0,
-            sh_entsize: 0,
-        });
+        self.sections.push(
+            SectionHeader {
+                sh_name: strtab_name as u32,
+                sh_type: SHT_STRTAB,
+                sh_offset: file_offset,
+                sh_size: self.symbol_names.total_len() as u64,
+                ..Default::default()
+            }
+            .into(),
+        );
         file_offset += self.symbol_names.total_len() as u64;
 
         // write the string table to file
@@ -352,21 +328,25 @@ impl<'d> Writer<'d> {
         }
 
         // add our string table section header
-        self.section_headers.push(SectionHeader {
-            sh_name: shstrtab_name as u32,
-            sh_type: SHT_STRTAB,
-            sh_flags: 0,
-            sh_addr: 0,
-            sh_offset: file_offset,
-            sh_size: self.section_names.total_len() as u64,
-            sh_link: 0,
-            sh_info: 0,
-            sh_addralign: 0,
-            sh_entsize: 0,
-        });
+        self.sections.push(
+            SectionHeader {
+                sh_name: shstrtab_name as u32,
+                sh_type: SHT_STRTAB,
+                sh_offset: file_offset,
+                sh_size: self.section_names.total_len() as u64,
+                ..Default::default()
+            }
+            .into(),
+        );
 
-        self.section_headers.serialize(&mut self.out);
-        program_headers.serialize(&mut self.out);
+        for section in &self.sections {
+            section.sh.serialize(&mut self.out);
+        }
+        for section in &self.sections {
+            if let Some(ph) = section.ph {
+                ph.serialize(&mut self.out);
+            }
+        }
     }
 }
 
@@ -387,5 +367,30 @@ fn sort_symbols_func(s1: &Sym, s2: &Sym) -> Ordering {
     match b1.cmp(&b2) {
         Ordering::Equal => t1.cmp(&t2),
         c => c,
+    }
+}
+
+const fn round_to(val: u64, multiple: u64) -> u64 {
+    let rem = val % multiple;
+    val + if rem != 0 { multiple - rem } else { 0 }
+}
+
+fn get_program_header(sh: &SectionHeader) -> Option<ProgramHeader> {
+    if sh.sh_flags as u32 & SHF_ALLOC == SHF_ALLOC {
+        let write = if sh.sh_flags as u32 & SHF_WRITE == SHF_WRITE { PF_W } else { 0 };
+        let exec = if sh.sh_flags as u32 & SHF_EXECINSTR == SHF_EXECINSTR { PF_X } else { 0 };
+        Some(ProgramHeader {
+            p_type: PT_LOAD,
+            p_flags: PF_R | write | exec,
+            p_align: PAGE_SIZE,
+            // all of these are patched later
+            p_offset: 0,
+            p_vaddr: 0,
+            p_paddr: 0,
+            p_filesz: 0,
+            p_memsz: 0,
+        })
+    } else {
+        None
     }
 }
