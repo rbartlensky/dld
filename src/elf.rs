@@ -22,7 +22,7 @@ pub use string_table::StringTable;
 
 const PAGE_SIZE: u64 = 0x1000;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct SectionRef {
     /// The section index where a particular section was relocated to.
     pub index: usize,
@@ -156,9 +156,12 @@ impl<'d> Writer<'d> {
         name: String,
         section: &goblin::elf::SectionHeader,
         data: Option<&[u8]>,
-    ) -> SectionRef {
+    ) -> Option<SectionRef> {
+        if section.sh_size == 0 {
+            return None;
+        }
         let data = data.map(|v| v.to_owned());
-        self.add_section(name, section, data)
+        Some(self.add_section(name, section, data))
     }
 
     fn add_symbol_inner<'s>(
@@ -188,7 +191,11 @@ impl<'d> Writer<'d> {
                         s.key().reference().display()
                     )))
                 } else if !s.key().is_weak() {
-                    s.get_mut().push(elf_sym);
+                    // if we already have a local symbol with the same name, pointing to
+                    // the same section, then there is no need to include it anymore
+                    if !s.get_mut().iter().any(|s| same_local_symbol(s, &elf_sym)) {
+                        s.get_mut().push(elf_sym);
+                    };
                     Ok(())
                 } else {
                     Ok(())
@@ -396,4 +403,12 @@ fn get_program_header(sh: &SectionHeader) -> Option<ProgramHeader> {
     } else {
         None
     }
+}
+
+fn same_local_symbol(s1: &Sym, s2: &Sym) -> bool {
+    s1.st_name == s2.st_name
+        && s1.st_info == s2.st_info
+        && s1.st_other == s2.st_other
+        && s1.st_shndx == s2.st_shndx
+        && s1.st_size == s2.st_size
 }

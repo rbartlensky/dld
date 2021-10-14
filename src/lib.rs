@@ -7,6 +7,7 @@ mod serialize;
 use error::{Error, ErrorExt};
 use goblin::{
     elf::{reloc::*, Elf},
+    elf32::section_header::SHN_UNDEF,
     elf64::section_header::{SHN_ABS, SHN_COMMON, SHT_DYNAMIC, SHT_HASH, SHT_NOTE, SHT_PROGBITS},
 };
 use std::{
@@ -26,25 +27,37 @@ pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>
             [SHT_PROGBITS, SHT_HASH, SHT_DYNAMIC, SHT_NOTE].contains(&sh.sh_type)
         }) {
             let name = get_section_name(&elf, section.sh_name).map_path_err(input)?;
-            let res =
-                writer.push_section(name.into(), section, section.file_range().map(|r| &buf[r]));
-            section_relocations.insert(i, res);
+            // empty section? don't care then
+            if let Some(res) =
+                writer.push_section(name.into(), section, section.file_range().map(|r| &buf[r]))
+            {
+                section_relocations.insert(i, res);
+            }
         }
         for symbol in &elf.syms {
             let name = get_symbol_name(&elf, symbol.st_name).map_path_err(input)?;
+            // if the symbol is pointing to an empty section, then we don't care about it
             let sec_ref =
-                *section_relocations.get(&(symbol.st_shndx as usize)).unwrap_or(&elf::SectionRef {
-                    index: symbol.st_shndx as usize,
-                    insertion_point: 0,
-                });
+                if let Some(sec_ref) = section_relocations.get(&(symbol.st_shndx as usize)) {
+                    *sec_ref
+                } else if symbol.st_shndx == SHN_ABS as usize {
+                    crate::elf::SectionRef { index: symbol.st_shndx, insertion_point: 0 }
+                } else {
+                    continue;
+                };
             writer.add_symbol(symbol.into(), sec_ref, name, input).map_path_err(input)?;
         }
         for (_, rels) in elf.shdr_relocs {
             for rel in rels.iter().filter(|r| r.r_sym != 0) {
                 let symbol = &elf.syms.get(rel.r_sym as usize - 1).unwrap();
-                if symbol.st_shndx == SHN_ABS as usize || symbol.st_shndx == SHN_COMMON as usize {
+                if symbol.st_shndx == SHN_UNDEF as usize || symbol.st_shndx == SHN_COMMON as usize {
                     continue;
                 }
+                let index = if let Some(sr) = section_relocations.get(&(symbol.st_shndx as usize)) {
+                    sr.index
+                } else {
+                    continue;
+                };
                 let s = symbol.st_value;
                 // XXX: is 0 ok for REL?
                 let a = rel.r_addend.unwrap_or_default();
@@ -55,11 +68,7 @@ pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>
                     R_X86_64_PC32 => s + (a - p as i64) as u64,
                     x => unimplemented!("Relocation {}", x),
                 };
-                writer.patch_section(
-                    section_relocations[&(symbol.st_shndx as usize)].index,
-                    rel.r_offset as usize,
-                    value,
-                );
+                writer.patch_section(index, rel.r_offset as usize, value);
             }
         }
     }
