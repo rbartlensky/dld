@@ -115,6 +115,8 @@ impl<'d> Writer<'d> {
         Ok(s)
     }
 
+    // TODO: section merging for mergeable sections:
+    // https://docs.oracle.com/cd/E23824_01/html/819-0690/ggdlu.html
     fn add_section(
         &mut self,
         name: impl Into<Name>,

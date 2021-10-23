@@ -8,7 +8,10 @@ use error::{Error, ErrorExt};
 use goblin::{
     elf::{reloc::*, Elf},
     elf32::section_header::SHN_UNDEF,
-    elf64::section_header::{SHN_ABS, SHN_COMMON, SHT_DYNAMIC, SHT_HASH, SHT_NOTE, SHT_PROGBITS},
+    elf64::section_header::{
+        SHN_ABS, SHN_COMMON, SHT_DYNAMIC, SHT_DYNSYM, SHT_REL, SHT_RELA, SHT_SHLIB, SHT_STRTAB,
+        SHT_SYMTAB,
+    },
 };
 use std::{
     collections::HashMap,
@@ -16,16 +19,21 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const SKIPPED_SECTIONS: &[u32] =
+    &[SHT_SYMTAB, SHT_DYNSYM, SHT_STRTAB, SHT_RELA, SHT_DYNAMIC, SHT_REL, SHT_SHLIB];
+
 pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>> {
     let mut writer = elf::Writer::new(output).map_path_err(output)?;
     let mut section_relocations = HashMap::new();
     for input in inputs.iter().map(|p| p.as_path()) {
         let buf = read(input).map_path_err(input)?;
         let elf = Elf::parse(&buf).map_path_err(input)?;
-        for (i, section) in elf.section_headers.iter().enumerate().filter(|(_, sh)| {
-            // TODO: not all sections are included
-            [SHT_PROGBITS, SHT_HASH, SHT_DYNAMIC, SHT_NOTE].contains(&sh.sh_type)
-        }) {
+        for (i, section) in elf
+            .section_headers
+            .iter()
+            .enumerate()
+            .filter(|(_, sh)| !SKIPPED_SECTIONS.contains(&sh.sh_type))
+        {
             let name = get_section_name(&elf, section.sh_name).map_path_err(input)?;
             // empty section? don't care then
             if let Some(res) =
