@@ -1,12 +1,15 @@
 use crate::{error::ErrorType, name::Name, serialize::Serialize, symbol::Symbol};
-use goblin::elf64::{
-    header::{Header, ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64, ET_EXEC, EV_CURRENT},
-    program_header::{ProgramHeader, PF_R, PF_W, PF_X, PT_LOAD},
-    section_header::{
-        SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_UNDEF,
-        SHT_NULL, SHT_STRTAB, SHT_SYMTAB,
+use goblin::{
+    elf32::section_header::SHT_PROGBITS,
+    elf64::{
+        header::{Header, ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64, ET_EXEC, EV_CURRENT},
+        program_header::{ProgramHeader, PF_R, PF_W, PF_X, PT_LOAD},
+        section_header::{
+            SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_UNDEF,
+            SHT_NULL, SHT_STRTAB, SHT_SYMTAB,
+        },
+        sym::{Sym, STB_LOCAL, STT_NOTYPE},
     },
-    sym::{Sym, STB_LOCAL, STT_NOTYPE},
 };
 use std::{
     cmp::Ordering,
@@ -66,6 +69,7 @@ pub struct Writer<'d> {
     symbol_names: StringTable,
     symbols: HashMap<Symbol<'d>, Vec<Sym>>,
     sections: Vec<Section>,
+    got: HashMap<u32, usize>,
 }
 
 impl<'d> Writer<'d> {
@@ -102,9 +106,16 @@ impl<'d> Writer<'d> {
             symbol_names: Default::default(),
             symbols: Default::default(),
             sections: Default::default(),
+            got: Default::default(),
         };
         let null_section = goblin::elf::SectionHeader { sh_type: SHT_NULL, ..Default::default() };
         s.add_section("", &null_section, None);
+        let got_section = goblin::elf::SectionHeader {
+            sh_type: SHT_PROGBITS,
+            sh_flags: (SHF_ALLOC | SHF_WRITE) as u64,
+            ..Default::default()
+        };
+        s.add_section(".got", &got_section, None);
         s.add_symbol_inner(
             Sym { st_shndx: SHN_UNDEF as u16, ..Default::default() },
             SectionRef { index: SHN_UNDEF as usize, insertion_point: 0 },
@@ -187,27 +198,25 @@ impl<'d> Writer<'d> {
         match self.symbols.entry(sym) {
             Entry::Occupied(mut s) => {
                 if s.key().is_global() {
-                    Err(ErrorType::Other(format!(
+                    return Err(ErrorType::Other(format!(
                         "Symbol {} already defined in {}",
                         s.key().name(),
                         s.key().reference().display()
-                    )))
+                    )));
                 } else if !s.key().is_weak() {
                     // if we already have a local symbol with the same name, pointing to
                     // the same section, then there is no need to include it anymore
                     if !s.get_mut().iter().any(|s| same_local_symbol(s, &elf_sym)) {
                         s.get_mut().push(elf_sym);
                     };
-                    Ok(())
                 } else {
-                    Ok(())
                 }
             }
             Entry::Vacant(v) => {
                 v.insert(vec![elf_sym]);
-                Ok(())
             }
         }
+        Ok(())
     }
 
     pub fn add_symbol<'s>(
@@ -224,11 +233,23 @@ impl<'d> Writer<'d> {
         self.add_symbol_inner(elf_sym, sec_ref, name, reference)
     }
 
-    pub fn patch_section(&mut self, section: usize, offset: usize, value: u64) {
+    pub fn patch_section(&mut self, section: usize, offset: usize, value: u32) {
         use byteorder::{LittleEndian, WriteBytesExt};
 
-        let mut slice = &mut self.sections[section].data[offset..offset + 8];
-        slice.write_u64::<LittleEndian>(value).unwrap();
+        let mut slice =
+            &mut self.sections[section].data[offset..offset + std::mem::size_of_val(&value)];
+        slice.write_u32::<LittleEndian>(value).unwrap();
+    }
+
+    pub fn got_entry(&mut self, name: &str) -> usize {
+        let name = name.to_string();
+        let st_name = self.symbol_names.get_or_create(name).offset as u32;
+        let len = self.got.len();
+        *self.got.entry(st_name).or_insert(len * size_of::<u64>())
+    }
+
+    pub fn got_address(&self) -> u64 {
+        self.sections[1].sh.sh_addr
     }
 
     // elf header
@@ -238,10 +259,13 @@ impl<'d> Writer<'d> {
     // section header 2
     // program header 1
     // ...
-    pub fn write_to_disk(mut self) {
+    pub fn compute_sections(&mut self) {
         let symtab_name = self.section_names.get_or_create(".symtab").offset;
         let strtab_name = self.section_names.get_or_create(".strtab").offset;
         let shstrtab_name = self.section_names.get_or_create(".shstrtab").offset;
+
+        // [1] == .got
+        self.sections[1].data.extend(std::iter::repeat(0).take(size_of::<u64>() * self.got.len()));
 
         // + 3 for strings and symbol table section
         self.eh.e_shnum = self.sections.len() as u16 + 3;
@@ -259,7 +283,6 @@ impl<'d> Writer<'d> {
         self.eh.e_phoff = shoff + (self.eh.e_shnum as usize * size_of::<SectionHeader>()) as u64;
         // last section is the section header string table
         self.eh.e_shstrndx = self.eh.e_shnum - 1;
-        self.eh.serialize(&mut self.out);
 
         let mut p_vaddr = self.eh.e_entry;
         // write all section data to file, and patch section and program headers
@@ -278,21 +301,20 @@ impl<'d> Writer<'d> {
             }
             if !section.data.is_empty() {
                 section.align_and_extend_data();
-                self.out.write_all(&section.data).unwrap();
                 file_offset += section.data.len() as u64;
-                section.data.clear();
             }
         }
 
         // write the symbols to disk and make sure that locals come first
+        let mut section = vec![];
         let mut section_len = 0;
-        let mut syms: Vec<Sym> = self.symbols.into_values().flatten().collect();
+        let mut syms: Vec<&mut Sym> = self.symbols.values_mut().flatten().collect();
         syms.sort_by(|s1, s2| sort_symbols_func(s1, s2));
         let mut last_local = 0;
         for mut sym in syms {
             sym.st_value +=
                 self.sections.get(sym.st_shndx as usize).map(|s| s.sh.sh_addr).unwrap_or(0);
-            section_len += sym.serialize(&mut self.out);
+            section_len += sym.serialize(&mut section);
             let st_bind = sym.st_info >> 4;
             if st_bind == STB_LOCAL {
                 last_local += 1;
@@ -300,8 +322,8 @@ impl<'d> Writer<'d> {
         }
 
         // add our symbol table section header
-        self.sections.push(
-            SectionHeader {
+        self.sections.push(Section {
+            sh: SectionHeader {
                 sh_name: symtab_name as u32,
                 sh_type: SHT_SYMTAB,
                 sh_offset: file_offset,
@@ -310,47 +332,58 @@ impl<'d> Writer<'d> {
                 sh_info: last_local,
                 sh_entsize: size_of::<Sym>() as u64,
                 ..Default::default()
-            }
-            .into(),
-        );
+            },
+            ph: None,
+            data: section,
+        });
         file_offset += section_len as u64;
 
+        let mut section = vec![];
         let names = self.symbol_names.sorted_names();
         for (name, _) in names {
-            name.serialize(&mut self.out);
+            name.serialize(&mut section);
         }
 
         // add our symbol string table section header
-        self.sections.push(
-            SectionHeader {
+        self.sections.push(Section {
+            sh: SectionHeader {
                 sh_name: strtab_name as u32,
                 sh_type: SHT_STRTAB,
                 sh_offset: file_offset,
                 sh_size: self.symbol_names.total_len() as u64,
                 ..Default::default()
-            }
-            .into(),
-        );
+            },
+            ph: None,
+            data: section,
+        });
         file_offset += self.symbol_names.total_len() as u64;
 
         // write the string table to file
+        let mut section = vec![];
         let names = self.section_names.sorted_names();
         for (name, _) in names {
-            name.serialize(&mut self.out);
+            name.serialize(&mut section);
         }
 
         // add our string table section header
-        self.sections.push(
-            SectionHeader {
+        self.sections.push(Section {
+            sh: SectionHeader {
                 sh_name: shstrtab_name as u32,
                 sh_type: SHT_STRTAB,
                 sh_offset: file_offset,
                 sh_size: self.section_names.total_len() as u64,
                 ..Default::default()
-            }
-            .into(),
-        );
+            },
+            ph: None,
+            data: section,
+        });
+    }
 
+    pub fn write_to_disk(mut self) {
+        self.eh.serialize(&mut self.out);
+        for section in &self.sections {
+            self.out.write_all(&section.data).unwrap();
+        }
         for section in &self.sections {
             section.sh.serialize(&mut self.out);
         }

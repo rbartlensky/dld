@@ -22,12 +22,26 @@ use std::{
 const SKIPPED_SECTIONS: &[u32] =
     &[SHT_SYMTAB, SHT_DYNSYM, SHT_STRTAB, SHT_RELA, SHT_DYNAMIC, SHT_REL, SHT_SHLIB];
 
+struct Input<'a> {
+    elf: Elf<'a>,
+    section_relocations: HashMap<usize, elf::SectionRef>,
+}
+
+#[allow(clippy::many_single_char_names)]
 pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>> {
     let mut writer = elf::Writer::new(output).map_path_err(output)?;
-    let mut section_relocations = HashMap::new();
-    for input in inputs.iter().map(|p| p.as_path()) {
-        let buf = read(input).map_path_err(input)?;
-        let elf = Elf::parse(&buf).map_path_err(input)?;
+    let inputs = inputs
+        .iter()
+        .map(|p| {
+            let input = p.as_path();
+            let elf = read(input).map_path_err(input)?;
+            Ok((elf, input))
+        })
+        .collect::<Result<Vec<(Vec<u8>, &Path)>, Error<'p>>>()?;
+    let mut elfs = Vec::with_capacity(inputs.len());
+    for (buf, input) in &inputs {
+        let elf = Elf::parse(buf).map_path_err(input)?;
+        let mut section_relocations = HashMap::new();
         for (i, section) in elf
             .section_headers
             .iter()
@@ -55,14 +69,44 @@ pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>
                 };
             writer.add_symbol(symbol.into(), sec_ref, name, input).map_path_err(input)?;
         }
-        for (_, rels) in elf.shdr_relocs {
+        // just scan relocs for now to find out how many GOT entries we have
+        for (_, rels) in &elf.shdr_relocs {
             for rel in rels.iter().filter(|r| r.r_sym != 0) {
                 let symbol = &elf.syms.get(rel.r_sym as usize - 1).unwrap();
                 if symbol.st_shndx == SHN_UNDEF as usize || symbol.st_shndx == SHN_COMMON as usize {
                     continue;
                 }
-                let index = if let Some(sr) = section_relocations.get(&(symbol.st_shndx as usize)) {
-                    sr.index
+                if section_relocations.get(&(symbol.st_shndx as usize)).is_none() {
+                    continue;
+                }
+                match rel.r_type {
+                    R_X86_64_32 | R_X86_64_NONE | R_X86_64_64 | R_X86_64_PC32 | R_X86_64_SIZE64 => {
+                    }
+                    R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
+                        let name = get_symbol_name(&elf, symbol.st_name).map_path_err(input)?;
+                        writer.got_entry(name);
+                    }
+                    R_X86_64_PLT32 => {
+                        unimplemented!("PLT relocations")
+                    }
+                    x => unimplemented!("Relocation {:?}", x),
+                }
+            }
+        }
+        elfs.push(Input { elf, section_relocations });
+    }
+    writer.compute_sections();
+    for (elf, section_relocations) in elfs.iter().map(|e| (&e.elf, &e.section_relocations)) {
+        for (_, rels) in &elf.shdr_relocs {
+            // TODO: too much repetition
+            for rel in rels.iter().filter(|r| r.r_sym != 0) {
+                let symbol = &elf.syms.get(rel.r_sym as usize - 1).unwrap();
+                if symbol.st_shndx == SHN_UNDEF as usize || symbol.st_shndx == SHN_COMMON as usize {
+                    continue;
+                }
+                let index = if let Some(sec) = section_relocations.get(&(symbol.st_shndx as usize))
+                {
+                    sec.index
                 } else {
                     continue;
                 };
@@ -70,13 +114,23 @@ pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>
                 // XXX: is 0 ok for REL?
                 let a = rel.r_addend.unwrap_or_default();
                 let p = rel.r_offset;
+                let z = symbol.st_size;
                 let value = match rel.r_type {
                     R_X86_64_NONE => s,
-                    R_X86_64_64 => s + a as u64,
+                    R_X86_64_32 | R_X86_64_64 => s + a as u64,
                     R_X86_64_PC32 => s + (a - p as i64) as u64,
-                    x => unimplemented!("Relocation {}", x),
+                    R_X86_64_SIZE64 => z + a as u64,
+                    R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
+                        let name = get_symbol_name(elf, symbol.st_name).unwrap();
+                        let g = writer.got_entry(name);
+                        let got = writer.got_address();
+                        let _ = g as u64 + got + (a - p as i64) as u64;
+                        unimplemented!("GOTPCRELX relocations");
+                    }
+                    x => unimplemented!("Relocation {:?}", x),
                 };
-                writer.patch_section(index, rel.r_offset as usize, value);
+                // TODO: check value for truncation
+                writer.patch_section(index, rel.r_offset as usize, value as u32);
             }
         }
     }
