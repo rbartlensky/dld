@@ -34,6 +34,13 @@ pub struct SectionRef {
     pub insertion_point: usize,
 }
 
+/// A symbol can be fetched by indexing `symbols` in the following way: `symbols[st_name][index]`.
+#[derive(Debug, Clone, Copy)]
+pub struct SymbolRef {
+    pub st_name: u32,
+    pub index: usize,
+}
+
 struct Section {
     /// The section header of the section.
     sh: SectionHeader,
@@ -67,9 +74,10 @@ pub struct Writer<'d> {
     eh: Header,
     section_names: StringTable,
     symbol_names: StringTable,
-    symbols: HashMap<Symbol<'d>, Vec<Sym>>,
+    symbols: HashMap<u32, Vec<Symbol<'d>>>,
     sections: Vec<Section>,
     got: HashMap<u32, usize>,
+    plt: HashMap<u32, usize>,
 }
 
 impl<'d> Writer<'d> {
@@ -107,6 +115,7 @@ impl<'d> Writer<'d> {
             symbols: Default::default(),
             sections: Default::default(),
             got: Default::default(),
+            plt: Default::default(),
         };
         let null_section = goblin::elf::SectionHeader { sh_type: SHT_NULL, ..Default::default() };
         s.add_section("", &null_section, None);
@@ -116,6 +125,7 @@ impl<'d> Writer<'d> {
             ..Default::default()
         };
         s.add_section(".got", &got_section, None);
+        s.add_section(".plt", &got_section, None);
         s.add_symbol_inner(
             Sym { st_shndx: SHN_UNDEF as u16, ..Default::default() },
             SectionRef { index: SHN_UNDEF as usize, insertion_point: 0 },
@@ -166,7 +176,7 @@ impl<'d> Writer<'d> {
 
     pub fn push_section(
         &mut self,
-        name: String,
+        name: impl Into<Name>,
         section: &goblin::elf::SectionHeader,
         data: Option<&[u8]>,
     ) -> Option<SectionRef> {
@@ -183,10 +193,10 @@ impl<'d> Writer<'d> {
         sec_ref: SectionRef,
         name: &'s str,
         reference: &'d Path,
-    ) -> Result<(), ErrorType> {
+    ) -> Result<SymbolRef, ErrorType> {
         let name = name.to_string();
-        elf_sym.st_name = self.symbol_names.get_or_create(name.clone()).offset as u32;
-        let sym = Symbol::new(name, &elf_sym, reference);
+        let st_name = self.symbol_names.get_or_create(name).offset as u32;
+        elf_sym.st_name = st_name;
         elf_sym.st_shndx = sec_ref.index as u16;
         match sec_ref.index as u32 {
             // TODO: handle
@@ -195,28 +205,36 @@ impl<'d> Writer<'d> {
                 elf_sym.st_value += sec_ref.insertion_point as u64;
             }
         }
-        match self.symbols.entry(sym) {
-            Entry::Occupied(mut s) => {
-                if s.key().is_global() {
-                    return Err(ErrorType::Other(format!(
-                        "Symbol {} already defined in {}",
-                        s.key().name(),
-                        s.key().reference().display()
-                    )));
-                } else if !s.key().is_weak() {
-                    // if we already have a local symbol with the same name, pointing to
-                    // the same section, then there is no need to include it anymore
-                    if !s.get_mut().iter().any(|s| same_local_symbol(s, &elf_sym)) {
-                        s.get_mut().push(elf_sym);
-                    };
-                } else {
+        let sym = Symbol::new(elf_sym, reference);
+        let index = match self.symbols.entry(st_name) {
+            Entry::Occupied(mut syms) => {
+                let mut found = None;
+                for (i, s) in syms.get().iter().enumerate() {
+                    if s.is_global() {
+                        return Err(ErrorType::Other(format!(
+                            "Symbol {} already defined in {}",
+                            "todo", //
+                            s.reference().display()
+                        )));
+                    } else if !s.is_weak() {
+                        // if we already have a local symbol with the same name, pointing to
+                        // the same section, then there is no need to include it anymore
+                        if same_local_symbol(&s.sym, &sym.sym) {
+                            found = Some(i);
+                        };
+                    }
                 }
+                found.unwrap_or_else(|| {
+                    syms.get_mut().push(sym);
+                    syms.get_mut().len() - 1
+                })
             }
             Entry::Vacant(v) => {
-                v.insert(vec![elf_sym]);
+                v.insert(vec![sym]);
+                0
             }
-        }
-        Ok(())
+        };
+        Ok(SymbolRef { st_name, index })
     }
 
     pub fn add_symbol<'s>(
@@ -225,27 +243,28 @@ impl<'d> Writer<'d> {
         sec_ref: SectionRef,
         name: &'s str,
         reference: &'d Path,
-    ) -> Result<(), ErrorType> {
+    ) -> Result<SymbolRef, ErrorType> {
         // ignore undef notypes
         if sec_ref.index as u32 == SHN_UNDEF && st_type(elf_sym.st_info) == STT_NOTYPE {
-            return Ok(());
+            return Ok(SymbolRef { st_name: 0, index: 0 });
         }
         self.add_symbol_inner(elf_sym, sec_ref, name, reference)
     }
 
-    pub fn patch_section(&mut self, section: usize, offset: usize, value: u32) {
-        use byteorder::{LittleEndian, WriteBytesExt};
-
-        let mut slice =
-            &mut self.sections[section].data[offset..offset + std::mem::size_of_val(&value)];
-        slice.write_u32::<LittleEndian>(value).unwrap();
+    pub fn section_offset(&mut self, section: usize, offset: usize) -> &mut [u8] {
+        &mut self.sections[section].data[offset..offset + size_of::<u64>()]
     }
 
-    pub fn got_entry(&mut self, name: &str) -> usize {
-        let name = name.to_string();
-        let st_name = self.symbol_names.get_or_create(name).offset as u32;
+    pub fn add_got_entry(&mut self, sym: SymbolRef) {
         let len = self.got.len();
-        *self.got.entry(st_name).or_insert(len * size_of::<u64>())
+        let offset = *self.got.entry(sym.st_name).or_insert(len * size_of::<u64>());
+        self.symbols.get_mut(&sym.st_name).unwrap()[sym.index].set_got_offset(offset);
+    }
+
+    pub fn add_plt_entry(&mut self, sym: SymbolRef) {
+        let len = self.plt.len();
+        let index = *self.plt.entry(sym.st_name).or_insert(len);
+        self.symbols.get_mut(&sym.st_name).unwrap()[sym.index].set_plt_index(index);
     }
 
     pub fn got_address(&self) -> u64 {
@@ -266,6 +285,7 @@ impl<'d> Writer<'d> {
 
         // [1] == .got
         self.sections[1].data.extend(std::iter::repeat(0).take(size_of::<u64>() * self.got.len()));
+        // TODO: handle .plt
 
         // + 3 for strings and symbol table section
         self.eh.e_shnum = self.sections.len() as u16 + 3;
@@ -308,7 +328,8 @@ impl<'d> Writer<'d> {
         // write the symbols to disk and make sure that locals come first
         let mut section = vec![];
         let mut section_len = 0;
-        let mut syms: Vec<&mut Sym> = self.symbols.values_mut().flatten().collect();
+        let mut syms: Vec<&mut Sym> =
+            self.symbols.values_mut().flatten().map(|s| &mut s.sym).collect();
         syms.sort_by(|s1, s2| sort_symbols_func(s1, s2));
         let mut last_local = 0;
         for mut sym in syms {
@@ -440,7 +461,7 @@ fn get_program_header(sh: &SectionHeader) -> Option<ProgramHeader> {
     }
 }
 
-fn same_local_symbol(s1: &Sym, s2: &Sym) -> bool {
+pub(crate) fn same_local_symbol(s1: &Sym, s2: &Sym) -> bool {
     s1.st_name == s2.st_name
         && s1.st_info == s2.st_info
         && s1.st_other == s2.st_other

@@ -4,9 +4,10 @@ mod name;
 mod symbol;
 mod serialize;
 
+use byteorder::{LittleEndian, WriteBytesExt};
 use error::{Error, ErrorExt};
 use goblin::{
-    elf::{reloc::*, Elf},
+    elf::{reloc::*, sym::Sym, Elf},
     elf32::section_header::SHN_UNDEF,
     elf64::section_header::{
         SHN_ABS, SHN_COMMON, SHT_DYNAMIC, SHT_DYNSYM, SHT_REL, SHT_RELA, SHT_SHLIB, SHT_STRTAB,
@@ -15,7 +16,9 @@ use goblin::{
 };
 use std::{
     collections::HashMap,
+    convert::TryInto,
     fs::read,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
 };
 
@@ -27,7 +30,30 @@ struct Input<'a> {
     section_relocations: HashMap<usize, elf::SectionRef>,
 }
 
-#[allow(clippy::many_single_char_names)]
+struct Symbol(Sym);
+
+impl PartialEq for Symbol {
+    fn eq(&self, s2: &Self) -> bool {
+        self.0.st_name == s2.0.st_name
+            && self.0.st_info == s2.0.st_info
+            && self.0.st_other == s2.0.st_other
+            && self.0.st_shndx == s2.0.st_shndx
+            && self.0.st_size == s2.0.st_size
+    }
+}
+
+impl Eq for Symbol {}
+
+impl Hash for Symbol {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.st_name.hash(state);
+        self.0.st_info.hash(state);
+        self.0.st_other.hash(state);
+        self.0.st_shndx.hash(state);
+        self.0.st_size.hash(state);
+    }
+}
+
 pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>> {
     let mut writer = elf::Writer::new(output).map_path_err(output)?;
     let inputs = inputs
@@ -42,6 +68,7 @@ pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>
     for (buf, input) in &inputs {
         let elf = Elf::parse(buf).map_path_err(input)?;
         let mut section_relocations = HashMap::new();
+        let mut symbols = HashMap::new();
         for (i, section) in elf
             .section_headers
             .iter()
@@ -51,7 +78,7 @@ pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>
             let name = get_section_name(&elf, section.sh_name).map_path_err(input)?;
             // empty section? don't care then
             if let Some(res) =
-                writer.push_section(name.into(), section, section.file_range().map(|r| &buf[r]))
+                writer.push_section(name.to_owned(), section, section.file_range().map(|r| &buf[r]))
             {
                 section_relocations.insert(i, res);
             }
@@ -67,7 +94,9 @@ pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>
                 } else {
                     continue;
                 };
-            writer.add_symbol(symbol.into(), sec_ref, name, input).map_path_err(input)?;
+            let symbol_ref =
+                writer.add_symbol(symbol.into(), sec_ref, name, input).map_path_err(input)?;
+            symbols.insert(Symbol(symbol), symbol_ref);
         }
         // just scan relocs for now to find out how many GOT entries we have
         for (_, rels) in &elf.shdr_relocs {
@@ -80,15 +109,21 @@ pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>
                     continue;
                 }
                 match rel.r_type {
+                    R_X86_64_8 | R_X86_64_16 | R_X86_64_PC16 | R_X86_64_PC8 => {
+                        return Err(Error::new(
+                            input,
+                            format!("Relocation {} not conforming to ABI.", rel.r_type),
+                        ));
+                    }
                     R_X86_64_32 | R_X86_64_NONE | R_X86_64_64 | R_X86_64_PC32 | R_X86_64_SIZE64 => {
                     }
-                    R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
-                        let name = get_symbol_name(&elf, symbol.st_name).map_path_err(input)?;
-                        writer.got_entry(name);
-                    }
-                    R_X86_64_PLT32 => {
-                        unimplemented!("PLT relocations")
-                    }
+                    R_X86_64_GOT32
+                    | R_X86_64_GOTPCREL
+                    | R_X86_64_GOTOFF64
+                    | R_X86_64_GOTPC32
+                    | R_X86_64_GOTPCRELX
+                    | R_X86_64_REX_GOTPCRELX => writer.add_got_entry(symbols[&Symbol(*symbol)]),
+                    R_X86_64_PLT32 => writer.add_plt_entry(symbols[&Symbol(*symbol)]),
                     x => unimplemented!("Relocation {:?}", x),
                 }
             }
@@ -110,27 +145,7 @@ pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>
                 } else {
                     continue;
                 };
-                let s = symbol.st_value;
-                // XXX: is 0 ok for REL?
-                let a = rel.r_addend.unwrap_or_default();
-                let p = rel.r_offset;
-                let z = symbol.st_size;
-                let value = match rel.r_type {
-                    R_X86_64_NONE => s,
-                    R_X86_64_32 | R_X86_64_64 => s + a as u64,
-                    R_X86_64_PC32 => s + (a - p as i64) as u64,
-                    R_X86_64_SIZE64 => z + a as u64,
-                    R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
-                        let name = get_symbol_name(elf, symbol.st_name).unwrap();
-                        let g = writer.got_entry(name);
-                        let got = writer.got_address();
-                        let _ = g as u64 + got + (a - p as i64) as u64;
-                        unimplemented!("GOTPCRELX relocations");
-                    }
-                    x => unimplemented!("Relocation {:?}", x),
-                };
-                // TODO: check value for truncation
-                writer.patch_section(index, rel.r_offset as usize, value as u32);
+                apply_relocation(elf, &mut writer, symbol, &rel, index);
             }
         }
     }
@@ -144,4 +159,35 @@ fn get_section_name<'e>(elf: &Elf<'e>, index: usize) -> Result<&'e str, String> 
 
 fn get_symbol_name<'e>(elf: &Elf<'e>, index: usize) -> Result<&'e str, String> {
     elf.strtab.get_at(index).ok_or_else(|| "Symbol not found in strtab.".to_string())
+}
+
+#[allow(clippy::many_single_char_names)]
+fn apply_relocation(
+    _elf: &Elf<'_>,
+    writer: &mut crate::elf::Writer,
+    symbol: &Sym,
+    rel: &Reloc,
+    section_index: usize,
+) {
+    let s: i64 = symbol.st_value.try_into().unwrap();
+    let a = rel.r_addend.unwrap_or_default();
+    let p: i64 = rel.r_offset.try_into().unwrap();
+    let _z = symbol.st_size;
+    let g: i64 = writer.got_address().try_into().unwrap();
+    match rel.r_type {
+        R_X86_64_NONE => {}
+        R_X86_64_64 => {
+            let mut section_offset = writer.section_offset(section_index, rel.r_offset as usize);
+            section_offset.write_i64::<LittleEndian>(s + a).unwrap()
+        }
+        R_X86_64_PC32 => {
+            let mut section_offset = writer.section_offset(section_index, rel.r_offset as usize);
+            section_offset.write_i32::<LittleEndian>((s + a - p).try_into().unwrap()).unwrap()
+        }
+        R_X86_64_GOT32 => {
+            let mut section_offset = writer.section_offset(section_index, rel.r_offset as usize);
+            section_offset.write_i32::<LittleEndian>((g + a).try_into().unwrap()).unwrap()
+        }
+        x => unimplemented!("Relocation {:?}", x),
+    }
 }
