@@ -13,6 +13,7 @@ pub struct Symbol<'r> {
     is_weak: bool,
     in_got: Option<usize>,
     in_plt: Option<usize>,
+    in_got_plt: Option<usize>,
 }
 
 impl<'r> Symbol<'r> {
@@ -25,6 +26,7 @@ impl<'r> Symbol<'r> {
             is_weak: bind == STB_WEAK,
             in_got: None,
             in_plt: None,
+            in_got_plt: None,
         }
     }
 
@@ -40,8 +42,24 @@ impl<'r> Symbol<'r> {
         self.reference
     }
 
+    pub fn got_offset(&self) -> Option<usize> {
+        self.in_got
+    }
+
+    pub fn got_plt_offset(&self) -> Option<usize> {
+        self.in_got_plt
+    }
+
+    pub fn plt_index(&self) -> Option<usize> {
+        self.in_plt
+    }
+
     pub fn set_got_offset(&mut self, offset: usize) {
         self.in_got = Some(offset);
+    }
+
+    pub fn set_got_plt_offset(&mut self, offset: usize) {
+        self.in_got_plt = Some(offset);
     }
 
     pub fn set_plt_index(&mut self, index: usize) {

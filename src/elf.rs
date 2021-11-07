@@ -1,4 +1,5 @@
 use crate::{error::ErrorType, name::Name, serialize::Serialize, symbol::Symbol};
+use byteorder::{LittleEndian, WriteBytesExt};
 use goblin::{
     elf32::section_header::SHT_PROGBITS,
     elf64::{
@@ -14,6 +15,7 @@ use goblin::{
 use std::{
     cmp::Ordering,
     collections::{hash_map::Entry, HashMap},
+    convert::TryInto,
     fs::File,
     io::Write,
     mem::size_of,
@@ -35,7 +37,7 @@ pub struct SectionRef {
 }
 
 /// A symbol can be fetched by indexing `symbols` in the following way: `symbols[st_name][index]`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct SymbolRef {
     pub st_name: u32,
     pub index: usize,
@@ -76,8 +78,9 @@ pub struct Writer<'d> {
     symbol_names: StringTable,
     symbols: HashMap<u32, Vec<Symbol<'d>>>,
     sections: Vec<Section>,
-    got: HashMap<u32, usize>,
-    plt: HashMap<u32, usize>,
+    got: HashMap<SymbolRef, usize>,
+    plt: HashMap<SymbolRef, usize>,
+    got_plt: HashMap<SymbolRef, usize>,
 }
 
 impl<'d> Writer<'d> {
@@ -116,6 +119,7 @@ impl<'d> Writer<'d> {
             sections: Default::default(),
             got: Default::default(),
             plt: Default::default(),
+            got_plt: Default::default(),
         };
         let null_section = goblin::elf::SectionHeader { sh_type: SHT_NULL, ..Default::default() };
         s.add_section("", &null_section, None);
@@ -125,6 +129,8 @@ impl<'d> Writer<'d> {
             ..Default::default()
         };
         s.add_section(".got", &got_section, None);
+        // .plt's personal .got
+        s.add_section(".got.plt", &got_section, None);
         s.add_section(".plt", &got_section, None);
         s.add_symbol_inner(
             Sym { st_shndx: SHN_UNDEF as u16, ..Default::default() },
@@ -256,19 +262,92 @@ impl<'d> Writer<'d> {
     }
 
     pub fn add_got_entry(&mut self, sym: SymbolRef) {
-        let len = self.got.len();
-        let offset = *self.got.entry(sym.st_name).or_insert(len * size_of::<u64>());
+        // first 3 entries are reserved
+        let len = self.got.len() + 3;
+        let offset = *self.got.entry(sym).or_insert(len * size_of::<u64>());
         self.symbols.get_mut(&sym.st_name).unwrap()[sym.index].set_got_offset(offset);
     }
 
     pub fn add_plt_entry(&mut self, sym: SymbolRef) {
         let len = self.plt.len();
-        let index = *self.plt.entry(sym.st_name).or_insert(len);
-        self.symbols.get_mut(&sym.st_name).unwrap()[sym.index].set_plt_index(index);
+        let index = *self.plt.entry(sym).or_insert(len);
+        let len = self.got_plt.len() + 3;
+        let offset = *self.got_plt.entry(sym).or_insert(len * size_of::<u64>());
+
+        let sym = &mut self.symbols.get_mut(&sym.st_name).unwrap()[sym.index];
+        sym.set_got_plt_offset(offset);
+        sym.set_plt_index(index);
     }
 
     pub fn got_address(&self) -> u64 {
-        self.sections[1].sh.sh_addr
+        self.sections[1].sh.sh_offset
+    }
+
+    pub fn plt_address(&self) -> u64 {
+        self.sections[3].sh.sh_offset
+    }
+
+    fn compute_got(&mut self) {
+        // [1] == .got
+        self.sections[1]
+            .data
+            .extend(std::iter::repeat(0).take(size_of::<u64>() * (self.got.len() + 3)));
+    }
+
+    fn compute_got_plt(&mut self) {
+        // [2] == .got.plt
+        self.sections[2].data.reserve(size_of::<u64>() * (self.got_plt.len() + 3));
+        self.sections[2]
+            .data
+            .extend(std::iter::repeat(0).take(size_of::<u64>() * (self.got_plt.len() + 3)));
+    }
+
+    fn patch_got_plt(&mut self) {
+        let plt_address = self.plt_address();
+        // [2] == .got.plt
+        for (sym, addr) in &self.got_plt {
+            let sym = &self.symbols[&sym.st_name][sym.index];
+            // 16 to skip the header, another 16 for all entries before plt_index, and then another 11
+            let plt_index = sym.plt_index().unwrap();
+            self.sections[2].data[*addr..]
+                .as_mut()
+                .write_u64::<LittleEndian>(plt_address + 16 * (plt_index as u64 + 1) + 11)
+                .unwrap();
+        }
+    }
+
+    fn compute_plt(&mut self) {
+        let got: u32 = self.got_address().try_into().unwrap();
+        let mut header = [
+            0xff, 0x35, 0x00, 0x00, 0x00, 0x00, // pushq  0x0(%rip)
+            0xff, 0x25, 0x00, 0x00, 0x00, 0x00, // jmpq   *0x0(%rip)
+            0x90, 0x90, 0x90, 0x90, // nop nop nop nop
+        ];
+        header[2..].as_mut().write_u32::<LittleEndian>(got + 8).unwrap();
+        header[8..].as_mut().write_u32::<LittleEndian>(got + 16).unwrap();
+        // [3] == .plt
+        self.sections[3].data.reserve((self.plt.len() + 1) * 16);
+        self.sections[3].data.extend(header);
+
+        let entry = [
+            0xff, 0x25, 0x00, 0x00, 0x00, 0x00, // jmpq   *0x0(%rip)
+            0x68, 0x00, 0x00, 0x00, 0x00, // push   $0x00000000
+            0xe9, 0x00, 0x00, 0x00, 0x00, // jmpq   0x0
+        ];
+        for _ in 0..self.plt.len() {
+            self.sections[3].data.extend(&entry);
+        }
+        for (symbol_ref, plt_index) in &self.plt {
+            let entry = &mut self.sections[3].data[16 * (plt_index + 1)..];
+            let sym = &self.symbols[&symbol_ref.st_name][symbol_ref.index];
+            let got_plt_offset = sym.got_plt_offset().unwrap().try_into().unwrap();
+            let plt_index: u32 = (*plt_index).try_into().unwrap();
+            entry[2..].as_mut().write_u32::<LittleEndian>(got_plt_offset).unwrap();
+            entry[7..].as_mut().write_u32::<LittleEndian>(plt_index).unwrap();
+            // we need to jump over all of the entries that we wrote so far, and the header
+            let plt_start_offset = (plt_index + 2) * 16;
+            entry[12..].as_mut().write_u32::<LittleEndian>(plt_start_offset).unwrap();
+        }
     }
 
     // elf header
@@ -283,9 +362,9 @@ impl<'d> Writer<'d> {
         let strtab_name = self.section_names.get_or_create(".strtab").offset;
         let shstrtab_name = self.section_names.get_or_create(".shstrtab").offset;
 
-        // [1] == .got
-        self.sections[1].data.extend(std::iter::repeat(0).take(size_of::<u64>() * self.got.len()));
-        // TODO: handle .plt
+        self.compute_got();
+        self.compute_got_plt();
+        self.compute_plt();
 
         // + 3 for strings and symbol table section
         self.eh.e_shnum = self.sections.len() as u16 + 3;
@@ -398,6 +477,8 @@ impl<'d> Writer<'d> {
             ph: None,
             data: section,
         });
+
+        self.patch_got_plt();
     }
 
     pub fn write_to_disk(mut self) {
