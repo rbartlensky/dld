@@ -32,6 +32,10 @@ impl StringTable {
         Entry { index: *i, offset: *offset, new }
     }
 
+    pub fn name(&self, offset: usize) -> Option<&Name> {
+        self.names.iter().find(|(_, v)| v.1 == offset).map(|(k, _)| k)
+    }
+
     pub fn total_len(&self) -> usize {
         self.total_len
     }

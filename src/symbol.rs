@@ -3,14 +3,12 @@ use std::{
     path::Path,
 };
 
-use goblin::elf64::sym::{Sym, STB_GLOBAL, STB_WEAK};
+use goblin::elf64::sym::{Sym, STB_GLOBAL, STB_LOCAL, STB_WEAK};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Symbol<'r> {
     pub sym: Sym,
     reference: &'r Path,
-    is_global: bool,
-    is_weak: bool,
     in_got: Option<usize>,
     in_plt: Option<usize>,
     in_got_plt: Option<usize>,
@@ -18,24 +16,23 @@ pub struct Symbol<'r> {
 
 impl<'r> Symbol<'r> {
     pub fn new(sym: Sym, reference: &'r Path) -> Self {
-        let bind = sym.st_info >> 4;
-        Self {
-            sym,
-            reference,
-            is_global: bind == STB_GLOBAL,
-            is_weak: bind == STB_WEAK,
-            in_got: None,
-            in_plt: None,
-            in_got_plt: None,
-        }
+        Self { sym, reference, in_got: None, in_plt: None, in_got_plt: None }
+    }
+
+    pub const fn st_bind(&self) -> u8 {
+        self.sym.st_info >> 4
     }
 
     pub const fn is_global(&self) -> bool {
-        self.is_global
+        self.st_bind() == STB_GLOBAL
     }
 
     pub const fn is_weak(&self) -> bool {
-        self.is_weak
+        self.st_bind() == STB_WEAK
+    }
+
+    pub const fn is_local(&self) -> bool {
+        self.st_bind() == STB_LOCAL
     }
 
     pub const fn reference(&self) -> &Path {
@@ -78,5 +75,13 @@ impl Eq for Symbol<'_> {}
 impl Hash for Symbol<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.sym.st_name.hash(state);
+    }
+}
+
+impl std::ops::Deref for Symbol<'_> {
+    type Target = Sym;
+
+    fn deref(&self) -> &Self::Target {
+        &self.sym
     }
 }

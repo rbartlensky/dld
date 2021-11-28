@@ -8,10 +8,11 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use error::{Error, ErrorExt};
 use goblin::{
     elf::{reloc::*, sym::Sym, Elf},
-    elf32::section_header::SHN_UNDEF,
-    elf64::section_header::{
-        SHN_ABS, SHN_COMMON, SHT_DYNAMIC, SHT_DYNSYM, SHT_REL, SHT_RELA, SHT_SHLIB, SHT_STRTAB,
-        SHT_SYMTAB,
+    elf64::{
+        header::EM_X86_64,
+        section_header::{
+            SHT_DYNAMIC, SHT_DYNSYM, SHT_REL, SHT_RELA, SHT_SHLIB, SHT_STRTAB, SHT_SYMTAB,
+        },
     },
 };
 use std::{
@@ -19,6 +20,7 @@ use std::{
     convert::TryInto,
     fs::read,
     hash::{Hash, Hasher},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -28,6 +30,7 @@ const SKIPPED_SECTIONS: &[u32] =
 struct Input<'a> {
     elf: Elf<'a>,
     section_relocations: HashMap<usize, elf::SectionRef>,
+    symbols: HashMap<Symbol, crate::elf::SymbolRef>,
 }
 
 struct Symbol(Sym);
@@ -56,6 +59,7 @@ impl Hash for Symbol {
 
 pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>> {
     let mut writer = elf::Writer::new(output).map_path_err(output)?;
+    let inputs2 = inputs;
     let inputs = inputs
         .iter()
         .map(|p| {
@@ -80,34 +84,26 @@ pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>
             if let Some(res) =
                 writer.push_section(name.to_owned(), section, section.file_range().map(|r| &buf[r]))
             {
+                log::trace!("Section '{}:{}' of {:?} mapped to {:?}", i, name, input, res);
                 section_relocations.insert(i, res);
+            } else {
+                log::trace!("Section '{}' of {:?} discarded", name, input);
             }
         }
         for symbol in &elf.syms {
             let name = get_symbol_name(&elf, symbol.st_name).map_path_err(input)?;
-            // if the symbol is pointing to an empty section, then we don't care about it
-            let sec_ref =
-                if let Some(sec_ref) = section_relocations.get(&(symbol.st_shndx as usize)) {
-                    *sec_ref
-                } else if symbol.st_shndx == SHN_ABS as usize {
-                    crate::elf::SectionRef { index: symbol.st_shndx, insertion_point: 0 }
-                } else {
-                    continue;
-                };
-            let symbol_ref =
-                writer.add_symbol(symbol.into(), sec_ref, name, input).map_path_err(input)?;
-            symbols.insert(Symbol(symbol), symbol_ref);
+            let sec_ref = section_relocations.get(&(symbol.st_shndx as usize));
+            let symbol_ref = writer
+                .add_symbol(symbol.into(), sec_ref.cloned(), name, input)
+                .map_path_err(input)?;
+            if let Some(sym) = symbol_ref {
+                symbols.insert(Symbol(symbol), sym);
+            }
         }
         // just scan relocs for now to find out how many GOT entries we have
         for (_, rels) in &elf.shdr_relocs {
             for rel in rels.iter().filter(|r| r.r_sym != 0) {
-                let symbol = &elf.syms.get(rel.r_sym as usize - 1).unwrap();
-                if symbol.st_shndx == SHN_UNDEF as usize || symbol.st_shndx == SHN_COMMON as usize {
-                    continue;
-                }
-                if section_relocations.get(&(symbol.st_shndx as usize)).is_none() {
-                    continue;
-                }
+                let symbol = &elf.syms.get(rel.r_sym as usize).unwrap();
                 match rel.r_type {
                     R_X86_64_8 | R_X86_64_16 | R_X86_64_PC16 | R_X86_64_PC8 => {
                         return Err(Error::new(
@@ -115,8 +111,8 @@ pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>
                             format!("Relocation {} not conforming to ABI.", rel.r_type),
                         ));
                     }
-                    R_X86_64_32 | R_X86_64_NONE | R_X86_64_64 | R_X86_64_PC32 | R_X86_64_SIZE64 => {
-                    }
+                    R_X86_64_32 | R_X86_64_32S | R_X86_64_NONE | R_X86_64_64 | R_X86_64_PC32
+                    | R_X86_64_SIZE64 => {}
                     R_X86_64_GOT32
                     | R_X86_64_GOTPCREL
                     | R_X86_64_GOTOFF64
@@ -124,28 +120,42 @@ pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>
                     | R_X86_64_GOTPCRELX
                     | R_X86_64_REX_GOTPCRELX => writer.add_got_entry(symbols[&Symbol(*symbol)]),
                     R_X86_64_PLT32 => writer.add_plt_entry(symbols[&Symbol(*symbol)]),
-                    x => unimplemented!("Relocation {:?}", x),
+                    x => unimplemented!("Relocation {}", r_to_str(x, EM_X86_64)),
                 }
             }
         }
-        elfs.push(Input { elf, section_relocations });
+        elfs.push(Input { elf, section_relocations, symbols });
     }
-    writer.compute_sections();
-    for (elf, section_relocations) in elfs.iter().map(|e| (&e.elf, &e.section_relocations)) {
-        for (_, rels) in &elf.shdr_relocs {
+    writer.compute_sections().map_path_err(output)?;
+    for (i, elf, section_relocations, symbols) in
+        elfs.iter().enumerate().map(|(i, e)| (i, &e.elf, &e.section_relocations, &e.symbols))
+    {
+        log::debug!("Input: {}", inputs2[i].display());
+        for (section_index, rels) in &elf.shdr_relocs {
             // TODO: too much repetition
-            for rel in rels.iter().filter(|r| r.r_sym != 0) {
-                let symbol = &elf.syms.get(rel.r_sym as usize - 1).unwrap();
-                if symbol.st_shndx == SHN_UNDEF as usize || symbol.st_shndx == SHN_COMMON as usize {
-                    continue;
-                }
-                let index = if let Some(sec) = section_relocations.get(&(symbol.st_shndx as usize))
-                {
-                    sec.index
+            for rel in rels.iter() {
+                let symbol = &elf.syms.get(rel.r_sym as usize).unwrap();
+                let index = if let Some(sec) = section_relocations.get(&(section_index - 1)) {
+                    *sec
                 } else {
                     continue;
                 };
-                apply_relocation(elf, &mut writer, symbol, &rel, index);
+                let symbol = if let Some(sym) = symbols.get(&Symbol(*symbol)) {
+                    sym
+                } else {
+                    log::trace!(
+                        "discarded relocation due to missing symbol {:?} type: {}",
+                        rel,
+                        r_to_str(rel.r_type, EM_X86_64)
+                    );
+                    continue;
+                };
+                log::trace!(
+                    "applying relocation {:?} type: {}",
+                    rel,
+                    r_to_str(rel.r_type, EM_X86_64)
+                );
+                apply_relocation(elf, &mut writer, *symbol, &rel, index);
             }
         }
     }
@@ -165,29 +175,89 @@ fn get_symbol_name<'e>(elf: &Elf<'e>, index: usize) -> Result<&'e str, String> {
 fn apply_relocation(
     _elf: &Elf<'_>,
     writer: &mut crate::elf::Writer,
-    symbol: &Sym,
+    symbol: crate::elf::SymbolRef,
     rel: &Reloc,
-    section_index: usize,
+    section_index: crate::elf::SectionRef,
 ) {
+    let symbol = writer.symbol(symbol);
+    let is_symbol_local = !symbol.is_local();
     let s: i64 = symbol.st_value.try_into().unwrap();
     let a = rel.r_addend.unwrap_or_default();
     let p: i64 = rel.r_offset.try_into().unwrap();
     let _z = symbol.st_size;
-    let g: i64 = writer.got_address().try_into().unwrap();
+    let got: i64 = writer.got_address().try_into().unwrap();
     match rel.r_type {
         R_X86_64_NONE => {}
         R_X86_64_64 => {
             let mut section_offset = writer.section_offset(section_index, rel.r_offset as usize);
             section_offset.write_i64::<LittleEndian>(s + a).unwrap()
         }
+        R_X86_64_32 => {
+            let mut section_offset = writer.section_offset(section_index, rel.r_offset as usize);
+            section_offset.write_i32::<LittleEndian>((s + a).try_into().unwrap()).unwrap()
+        }
         R_X86_64_PC32 => {
             let mut section_offset = writer.section_offset(section_index, rel.r_offset as usize);
             section_offset.write_i32::<LittleEndian>((s + a - p).try_into().unwrap()).unwrap()
         }
         R_X86_64_GOT32 => {
+            let g: i64 = symbol.got_offset().unwrap().try_into().unwrap();
             let mut section_offset = writer.section_offset(section_index, rel.r_offset as usize);
             section_offset.write_i32::<LittleEndian>((g + a).try_into().unwrap()).unwrap()
         }
-        x => unimplemented!("Relocation {:?}", x),
+        R_X86_64_GOTPCRELX if is_symbol_local => {
+            // -2 because the offset points to where we need to patch, but we want to
+            // match the other two bytes to tell which instruction we're patching
+            let buf = writer.section_offset(section_index, rel.r_offset as usize - 2);
+            let value: i32 = (s + a - p).try_into().unwrap();
+            match buf[..2] {
+                // call *foo@GOTPCREL(%rip) -> call foo nop
+                [0xff, 0x15] => {
+                    buf[0] = 0xe8;
+                    buf[1..5].as_mut().write_i32::<LittleEndian>(value).unwrap();
+                    buf[5] = 0x90;
+                }
+                // jmp *foo@GOTPCREL(%rip) -> jmp foo nop
+                [0xff, 0x25] => {
+                    buf[0] = 0xe9;
+                    buf[1..5].as_mut().write_i32::<LittleEndian>(value).unwrap();
+                    buf[5] = 0x90;
+                }
+                ref x => unreachable!("{:?}", x),
+            }
+        }
+        R_X86_64_REX_GOTPCRELX => {
+            if is_symbol_local {
+                let buf = writer.section_offset(section_index, rel.r_offset as usize - 3);
+                let instr = match buf[..3] {
+                    [0x48, 0x8b, 0x05] => [0x48, 0xc7, 0xc0], // mov 0x0(%rip),%rax -> mov $0x0,%rax
+                    [0x48, 0x8b, 0x1d] => [0x48, 0xc7, 0xc3], // mov 0x0(%rip),%rbx -> mov $0x0,%rbx
+                    [0x48, 0x8b, 0x0d] => [0x48, 0xc7, 0xc1], // mov 0x0(%rip),%rcx -> mov $0x0,%rcx
+                    [0x48, 0x8b, 0x15] => [0x48, 0xc7, 0xc2], // mov 0x0(%rip),%rdx -> mov $0x0,%rdx
+                    [0x48, 0x8b, 0x35] => [0x48, 0xc7, 0xc6], // mov 0x0(%rip),%rsi -> mov $0x0,%rsi
+                    [0x48, 0x8b, 0x3d] => [0x48, 0xc7, 0xc7], // mov 0x0(%rip),%rdi -> mov $0x0,%rdi
+                    [0x48, 0x8b, 0x25] => [0x48, 0xc7, 0xc4], // mov 0x0(%rip),%rsp -> mov $0x0,%rsp
+                    [0x48, 0x8b, 0x2d] => [0x48, 0xc7, 0xc5], // mov 0x0(%rip),%rbp -> mov $0x0,%rbp
+                    [0x4c, 0x8b, 0x05] => [0x49, 0xc7, 0xc0], // mov 0x0(%rip),%r8 -> mov $0x0,%r8
+                    [0x4c, 0x8b, 0x0d] => [0x49, 0xc7, 0xc1], // mov 0x0(%rip),%r9 -> mov $0x0,%r9
+                    [0x4c, 0x8b, 0x15] => [0x49, 0xc7, 0xc2], // mov 0x0(%rip),%r10 -> mov $0x0,%r10
+                    [0x4c, 0x8b, 0x1d] => [0x49, 0xc7, 0xc3], // mov 0x0(%rip),%r11 -> mov $0x0,%r11
+                    [0x4c, 0x8b, 0x25] => [0x49, 0xc7, 0xc4], // mov 0x0(%rip),%r12 -> mov $0x0,%r12
+                    [0x4c, 0x8b, 0x2d] => [0x49, 0xc7, 0xc5], // mov 0x0(%rip),%r13 -> mov $0x0,%r13
+                    [0x4c, 0x8b, 0x35] => [0x49, 0xc7, 0xc6], // mov 0x0(%rip),%r14 -> mov $0x0,%r14
+                    [0x4c, 0x8b, 0x3d] => [0x49, 0xc7, 0xc7], // mov 0x0(%rip),%r15 -> mov $0x0,%r15
+                    ref x => unreachable!("{:?}", &x),
+                };
+                buf[..3].as_mut().write_all(&instr).unwrap();
+                let value: i32 = (s + a - p).try_into().unwrap();
+                buf[3..].as_mut().write_i32::<LittleEndian>(value).unwrap()
+            } else {
+                let g: i64 = symbol.got_offset().unwrap().try_into().unwrap();
+                let value: i32 = (g + got + a - p).try_into().unwrap();
+                let buf = writer.section_offset(section_index, rel.r_offset as usize);
+                buf[3..].as_mut().write_i32::<LittleEndian>(value).unwrap()
+            };
+        }
+        x => unimplemented!("Relocation {}", r_to_str(x, EM_X86_64)),
     }
 }

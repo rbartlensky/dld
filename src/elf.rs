@@ -9,7 +9,7 @@ use goblin::{
             SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_UNDEF,
             SHT_NULL, SHT_STRTAB, SHT_SYMTAB,
         },
-        sym::{Sym, STB_LOCAL, STT_NOTYPE},
+        sym::{Sym, STB_LOCAL},
     },
 };
 use std::{
@@ -132,9 +132,9 @@ impl<'d> Writer<'d> {
         // .plt's personal .got
         s.add_section(".got.plt", &got_section, None);
         s.add_section(".plt", &got_section, None);
-        s.add_symbol_inner(
+        s.add_symbol(
             Sym { st_shndx: SHN_UNDEF as u16, ..Default::default() },
-            SectionRef { index: SHN_UNDEF as usize, insertion_point: 0 },
+            None,
             "",
             Path::new(""),
         )
@@ -193,33 +193,32 @@ impl<'d> Writer<'d> {
         Some(self.add_section(name, section, data))
     }
 
-    fn add_symbol_inner<'s>(
+    pub fn add_symbol<'s>(
         &mut self,
         mut elf_sym: Sym,
-        sec_ref: SectionRef,
+        sec_ref: Option<SectionRef>,
         name: &'s str,
         reference: &'d Path,
-    ) -> Result<SymbolRef, ErrorType> {
+    ) -> Result<Option<SymbolRef>, ErrorType> {
         let name = name.to_string();
-        let st_name = self.symbol_names.get_or_create(name).offset as u32;
+        let st_name = self.symbol_names.get_or_create(name.clone()).offset as u32;
         elf_sym.st_name = st_name;
-        elf_sym.st_shndx = sec_ref.index as u16;
-        match sec_ref.index as u32 {
-            // TODO: handle
-            SHN_ABS | SHN_COMMON | SHN_UNDEF => {}
-            _ => {
-                elf_sym.st_value += sec_ref.insertion_point as u64;
-            }
+        if let Some(sec_ref) = sec_ref {
+            assert!(![SHN_ABS, SHN_COMMON, SHN_UNDEF].contains(&(elf_sym.st_shndx as u32)));
+            elf_sym.st_shndx = sec_ref.index as u16;
+            elf_sym.st_value += sec_ref.insertion_point as u64;
+        } else if ![SHN_ABS, SHN_COMMON, SHN_UNDEF].contains(&(elf_sym.st_shndx as u32)) {
+            return Ok(None);
         }
         let sym = Symbol::new(elf_sym, reference);
         let index = match self.symbols.entry(st_name) {
             Entry::Occupied(mut syms) => {
                 let mut found = None;
                 for (i, s) in syms.get().iter().enumerate() {
-                    if s.is_global() {
+                    if s.is_global() && s.st_shndx as u32 != SHN_UNDEF {
                         return Err(ErrorType::Other(format!(
                             "Symbol {} already defined in {}",
-                            "todo", //
+                            name,
                             s.reference().display()
                         )));
                     } else if !s.is_weak() {
@@ -240,30 +239,21 @@ impl<'d> Writer<'d> {
                 0
             }
         };
-        Ok(SymbolRef { st_name, index })
+        Ok(Some(SymbolRef { st_name, index }))
     }
 
-    pub fn add_symbol<'s>(
-        &mut self,
-        elf_sym: Sym,
-        sec_ref: SectionRef,
-        name: &'s str,
-        reference: &'d Path,
-    ) -> Result<SymbolRef, ErrorType> {
-        // ignore undef notypes
-        if sec_ref.index as u32 == SHN_UNDEF && st_type(elf_sym.st_info) == STT_NOTYPE {
-            return Ok(SymbolRef { st_name: 0, index: 0 });
-        }
-        self.add_symbol_inner(elf_sym, sec_ref, name, reference)
+    pub fn symbol(&self, sym: SymbolRef) -> Symbol<'_> {
+        self.symbols[&sym.st_name][sym.index]
     }
 
-    pub fn section_offset(&mut self, section: usize, offset: usize) -> &mut [u8] {
-        &mut self.sections[section].data[offset..offset + size_of::<u64>()]
+    pub fn section_offset(&mut self, section: SectionRef, offset: usize) -> &mut [u8] {
+        let offset = offset + section.insertion_point;
+        &mut self.sections[section.index].data[offset..offset + size_of::<u64>()]
     }
 
     pub fn add_got_entry(&mut self, sym: SymbolRef) {
-        // first 3 entries are reserved
-        let len = self.got.len() + 3;
+        // first entry is reserved
+        let len = self.got.len() + 1;
         let offset = *self.got.entry(sym).or_insert(len * size_of::<u64>());
         self.symbols.get_mut(&sym.st_name).unwrap()[sym.index].set_got_offset(offset);
     }
@@ -291,7 +281,7 @@ impl<'d> Writer<'d> {
         // [1] == .got
         self.sections[1]
             .data
-            .extend(std::iter::repeat(0).take(size_of::<u64>() * (self.got.len() + 3)));
+            .extend(std::iter::repeat(0).take(size_of::<u64>() * (self.got.len() + 1)));
     }
 
     fn compute_got_plt(&mut self) {
@@ -357,7 +347,7 @@ impl<'d> Writer<'d> {
     // section header 2
     // program header 1
     // ...
-    pub fn compute_sections(&mut self) {
+    pub fn compute_sections(&mut self) -> Result<(), ErrorType> {
         let symtab_name = self.section_names.get_or_create(".symtab").offset;
         let strtab_name = self.section_names.get_or_create(".strtab").offset;
         let shstrtab_name = self.section_names.get_or_create(".shstrtab").offset;
@@ -410,15 +400,26 @@ impl<'d> Writer<'d> {
         let mut syms: Vec<&mut Sym> =
             self.symbols.values_mut().flatten().map(|s| &mut s.sym).collect();
         syms.sort_by(|s1, s2| sort_symbols_func(s1, s2));
+        let mut undefined_symbols = vec![];
         let mut last_local = 0;
-        for mut sym in syms {
+        for sym in syms {
+            let st_bind = sym.st_info >> 4;
+            if sym.st_shndx as u32 == SHN_UNDEF && st_bind != STB_LOCAL {
+                undefined_symbols
+                    .push(self.symbol_names.name(sym.st_name as usize).unwrap().to_string());
+                continue;
+            }
+            // since we now have an address for our sections, we can patch the
+            // final value of all symbols
             sym.st_value +=
                 self.sections.get(sym.st_shndx as usize).map(|s| s.sh.sh_addr).unwrap_or(0);
             section_len += sym.serialize(&mut section);
-            let st_bind = sym.st_info >> 4;
             if st_bind == STB_LOCAL {
                 last_local += 1;
             }
+        }
+        if !undefined_symbols.is_empty() {
+            return Err(ErrorType::Other(format!("undefined symbols: {:?}", undefined_symbols)));
         }
 
         // add our symbol table section header
@@ -479,6 +480,7 @@ impl<'d> Writer<'d> {
         });
 
         self.patch_got_plt();
+        Ok(())
     }
 
     pub fn write_to_disk(mut self) {

@@ -26,6 +26,7 @@ struct AppArgs {
 }
 
 fn main() -> Result<(), String> {
+    env_logger::init();
     let mut args = parse_args();
     if args.help {
         println!("{}", HELP);
