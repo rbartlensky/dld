@@ -185,12 +185,9 @@ impl<'d> Writer<'d> {
         name: impl Into<Name>,
         section: &goblin::elf::SectionHeader,
         data: Option<&[u8]>,
-    ) -> Option<SectionRef> {
-        if section.sh_size == 0 {
-            return None;
-        }
+    ) -> SectionRef {
         let data = data.map(|v| v.to_owned());
-        Some(self.add_section(name, section, data))
+        self.add_section(name, section, data)
     }
 
     pub fn add_symbol<'s>(
@@ -204,7 +201,6 @@ impl<'d> Writer<'d> {
         let st_name = self.symbol_names.get_or_create(name.clone()).offset as u32;
         elf_sym.st_name = st_name;
         if let Some(sec_ref) = sec_ref {
-            assert!(![SHN_ABS, SHN_COMMON, SHN_UNDEF].contains(&(elf_sym.st_shndx as u32)));
             elf_sym.st_shndx = sec_ref.index as u16;
             elf_sym.st_value += sec_ref.insertion_point as u64;
         } else if ![SHN_ABS, SHN_COMMON, SHN_UNDEF].contains(&(elf_sym.st_shndx as u32)) {
@@ -214,13 +210,22 @@ impl<'d> Writer<'d> {
         let index = match self.symbols.entry(st_name) {
             Entry::Occupied(mut syms) => {
                 let mut found = None;
-                for (i, s) in syms.get().iter().enumerate() {
-                    if s.is_global() && s.st_shndx as u32 != SHN_UNDEF {
-                        return Err(ErrorType::Other(format!(
-                            "Symbol {} already defined in {}",
-                            name,
-                            s.reference().display()
-                        )));
+                for (i, s) in syms.get_mut().iter_mut().enumerate() {
+                    if s.is_global() {
+                        // we already found a definition for this symbol
+                        if s.st_shndx as u32 != SHN_UNDEF {
+                            return Err(ErrorType::Other(format!(
+                                "Symbol {} already defined in {}",
+                                name,
+                                s.reference().display()
+                            )));
+                        } else if sym.st_shndx as u32 != SHN_UNDEF {
+                            // if we find the same global symbol in another
+                            // lib that points to a valid section, we can steal
+                            // that symbol to make it defined
+                            *s = sym;
+                            found = Some(i);
+                        }
                     } else if !s.is_weak() {
                         // if we already have a local symbol with the same name, pointing to
                         // the same section, then there is no need to include it anymore

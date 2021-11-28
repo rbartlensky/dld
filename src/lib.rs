@@ -80,15 +80,13 @@ pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>
             .filter(|(_, sh)| !SKIPPED_SECTIONS.contains(&sh.sh_type))
         {
             let name = get_section_name(&elf, section.sh_name).map_path_err(input)?;
-            // empty section? don't care then
-            if let Some(res) =
-                writer.push_section(name.to_owned(), section, section.file_range().map(|r| &buf[r]))
-            {
-                log::trace!("Section '{}:{}' of {:?} mapped to {:?}", i, name, input, res);
-                section_relocations.insert(i, res);
-            } else {
-                log::trace!("Section '{}' of {:?} discarded", name, input);
-            }
+            let section_ref = writer.push_section(
+                name.to_owned(),
+                section,
+                section.file_range().map(|r| &buf[r]),
+            );
+            log::trace!("Section '{}:{}' of {:?} mapped to {:?}", i, name, input, section_ref);
+            section_relocations.insert(i, section_ref);
         }
         for symbol in &elf.syms {
             let name = get_symbol_name(&elf, symbol.st_name).map_path_err(input)?;
