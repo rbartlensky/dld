@@ -9,7 +9,7 @@ use goblin::{
             SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_UNDEF,
             SHT_NULL, SHT_STRTAB, SHT_SYMTAB,
         },
-        sym::{Sym, STB_LOCAL},
+        sym::{Sym, STB_GLOBAL, STB_LOCAL},
     },
 };
 use std::{
@@ -421,7 +421,7 @@ impl<'d> Writer<'d> {
         let mut last_local = 0;
         for sym in syms {
             let st_bind = sym.st_info >> 4;
-            if sym.st_shndx as u32 == SHN_UNDEF && st_bind != STB_LOCAL {
+            if sym.st_shndx as u32 == SHN_UNDEF && st_bind == STB_GLOBAL {
                 undefined_symbols
                     .push(self.symbol_names.name(sym.st_name as usize).unwrap().to_string());
                 continue;
