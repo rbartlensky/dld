@@ -200,6 +200,7 @@ impl<'d> Writer<'d> {
         let name = name.to_string();
         let st_name = self.symbol_names.get_or_create(name.clone()).offset as u32;
         elf_sym.st_name = st_name;
+        log::trace!("name: '{}' -> sym: {:?}", name, elf_sym);
         if let Some(sec_ref) = sec_ref {
             elf_sym.st_shndx = sec_ref.index as u16;
             elf_sym.st_value += sec_ref.insertion_point as u64;
@@ -224,6 +225,9 @@ impl<'d> Writer<'d> {
                             // lib that points to a valid section, we can steal
                             // that symbol to make it defined
                             *s = sym;
+                            found = Some(i);
+                        } else {
+                            // found the same undefined symbol twice, no need to duplicate it
                             found = Some(i);
                         }
                     } else if !s.is_weak() {
