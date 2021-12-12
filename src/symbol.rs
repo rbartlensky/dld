@@ -85,3 +85,9 @@ impl std::ops::Deref for Symbol<'_> {
         &self.sym
     }
 }
+
+impl std::ops::DerefMut for Symbol<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.sym
+    }
+}

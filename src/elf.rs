@@ -291,6 +291,14 @@ impl<'d> Writer<'d> {
         self.sections[1]
             .data
             .extend(std::iter::repeat(0).take(size_of::<u64>() * (self.got.len() + 1)));
+        if let Some(e) = self.symbol_names.get("_GLOBAL_OFFSET_TABLE_") {
+            let got_addr = self.got_address();
+            self.symbols.entry(e.offset as u32).and_modify(|s| {
+                // 1 == .got section
+                s[0].st_shndx = 1;
+                s[0].st_value = got_addr
+            });
+        }
     }
 
     fn compute_got_plt(&mut self) {

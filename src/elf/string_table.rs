@@ -2,6 +2,7 @@ use crate::name::Name;
 
 use std::collections::HashMap;
 
+#[derive(Debug)]
 pub struct Entry {
     pub index: usize,
     pub offset: usize,
@@ -30,6 +31,13 @@ impl StringTable {
         });
         self.total_len += add_len;
         Entry { index: *i, offset: *offset, new }
+    }
+
+    pub fn get(&mut self, name: impl Into<Name>) -> Option<Entry> {
+        let name = name.into();
+        self.names.get(&name).map(|(i, o)| {
+            Entry { index: *i, offset: *o, new: false }
+        })
     }
 
     pub fn name(&self, offset: usize) -> Option<&Name> {
