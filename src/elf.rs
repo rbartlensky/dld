@@ -428,7 +428,10 @@ impl<'d> Writer<'d> {
             }
         }
         if !undefined_symbols.is_empty() {
-            return Err(ErrorType::Other(format!("undefined symbols: {:?}", undefined_symbols)));
+            return Err(ErrorType::Other(format!(
+                "undefined symbols: {}",
+                format_list(&undefined_symbols)
+            )));
         }
 
         // add our symbol table section header
@@ -559,4 +562,11 @@ pub(crate) fn same_local_symbol(s1: &Sym, s2: &Sym) -> bool {
         && s1.st_other == s2.st_other
         && s1.st_shndx == s2.st_shndx
         && s1.st_size == s2.st_size
+}
+
+fn format_list(v: &[String]) -> String {
+    let mut s = String::from("[");
+    s += &v.join(", ");
+    s += "]";
+    s
 }
