@@ -35,9 +35,7 @@ impl StringTable {
 
     pub fn get(&mut self, name: impl Into<Name>) -> Option<Entry> {
         let name = name.into();
-        self.names.get(&name).map(|(i, o)| {
-            Entry { index: *i, offset: *o, new: false }
-        })
+        self.names.get(&name).map(|(i, o)| Entry { index: *i, offset: *o, new: false })
     }
 
     pub fn name(&self, offset: usize) -> Option<&Name> {

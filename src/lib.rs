@@ -1,5 +1,5 @@
 pub mod error;
-mod elf;
+pub mod elf;
 mod name;
 mod symbol;
 mod serialize;
@@ -57,8 +57,8 @@ impl Hash for Symbol {
     }
 }
 
-pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>> {
-    let mut writer = elf::Writer::new(output).map_path_err(output)?;
+pub fn link<'p>(inputs: &'p [PathBuf], options: &'p crate::elf::Options) -> Result<(), Error<'p>> {
+    let mut writer = elf::Writer::new(options).map_path_err(options.output.as_path())?;
     let inputs2 = inputs;
     let inputs = inputs
         .iter()
@@ -124,7 +124,7 @@ pub fn link<'p>(inputs: &'p [PathBuf], output: &'p Path) -> Result<(), Error<'p>
         }
         elfs.push(Input { elf, section_relocations, symbols });
     }
-    writer.compute_sections().map_path_err(output)?;
+    writer.compute_sections().map_path_err(options.output.as_path())?;
     for (i, elf, section_relocations, symbols) in
         elfs.iter().enumerate().map(|(i, e)| (i, &e.elf, &e.section_relocations, &e.symbols))
     {

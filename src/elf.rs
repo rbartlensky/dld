@@ -22,6 +22,9 @@ use std::{
     path::Path,
 };
 
+mod options;
+pub use options::*;
+
 mod string_table;
 pub use string_table::StringTable;
 
@@ -84,8 +87,8 @@ pub struct Writer<'d> {
 }
 
 impl<'d> Writer<'d> {
-    pub fn new(output: &Path) -> std::io::Result<Self> {
-        let out = File::create(output)?;
+    pub fn new(options: &'d options::Options) -> std::io::Result<Self> {
+        let out = File::create(options.output.as_path())?;
         let eh = Header {
             #[rustfmt::skip]
             e_ident: [
