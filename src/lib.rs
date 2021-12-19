@@ -27,12 +27,6 @@ use std::{
 const SKIPPED_SECTIONS: &[u32] =
     &[SHT_SYMTAB, SHT_DYNSYM, SHT_STRTAB, SHT_RELA, SHT_DYNAMIC, SHT_REL, SHT_SHLIB];
 
-struct Input<'a> {
-    elf: Elf<'a>,
-    section_relocations: HashMap<usize, elf::SectionRef>,
-    symbols: HashMap<Symbol, crate::elf::SymbolRef>,
-}
-
 struct Symbol(Sym);
 
 impl PartialEq for Symbol {
@@ -57,20 +51,23 @@ impl Hash for Symbol {
     }
 }
 
-pub fn link<'p>(inputs: &'p [PathBuf], options: &'p crate::elf::Options) -> Result<(), Error<'p>> {
-    let mut writer = elf::Writer::new(options).map_path_err(options.output.as_path())?;
-    let inputs2 = inputs;
-    let inputs = inputs
-        .iter()
-        .map(|p| {
-            let input = p.as_path();
-            let elf = read(input).map_path_err(input)?;
-            Ok((elf, input))
-        })
-        .collect::<Result<Vec<(Vec<u8>, &Path)>, Error<'p>>>()?;
-    let mut elfs = Vec::with_capacity(inputs.len());
-    for (buf, input) in &inputs {
-        let elf = Elf::parse(buf).map_path_err(input)?;
+pub struct Object<'o> {
+    path: &'o Path,
+    data: Vec<u8>,
+}
+
+pub struct ProcessedObject<'e> {
+    elf: Elf<'e>,
+    section_relocations: HashMap<usize, elf::SectionRef>,
+    symbols: HashMap<Symbol, elf::SymbolRef>,
+}
+
+impl<'o> Object<'o> {
+    pub fn process<'e>(
+        &'e self,
+        writer: &mut elf::Writer<'o>,
+    ) -> Result<ProcessedObject<'e>, Error<'o>> {
+        let elf = Elf::parse(&self.data).map_path_err(self.path)?;
         let mut section_relocations = HashMap::new();
         let mut symbols = HashMap::new();
         for (i, section) in elf
@@ -79,21 +76,21 @@ pub fn link<'p>(inputs: &'p [PathBuf], options: &'p crate::elf::Options) -> Resu
             .enumerate()
             .filter(|(_, sh)| !SKIPPED_SECTIONS.contains(&sh.sh_type))
         {
-            let name = get_section_name(&elf, section.sh_name).map_path_err(input)?;
+            let name = get_section_name(&elf, section.sh_name).map_path_err(self.path)?;
             let section_ref = writer.push_section(
                 name.to_owned(),
                 section,
-                section.file_range().map(|r| &buf[r]),
+                section.file_range().map(|r| &self.data[r]),
             );
-            log::trace!("Section '{}:{}' of {:?} mapped to {:?}", i, name, input, section_ref);
+            log::trace!("Section '{}:{}' of {:?} mapped to {:?}", i, name, self.path, section_ref);
             section_relocations.insert(i, section_ref);
         }
         for symbol in &elf.syms {
-            let name = get_symbol_name(&elf, symbol.st_name).map_path_err(input)?;
+            let name = get_symbol_name(&elf, symbol.st_name).map_path_err(self.path)?;
             let sec_ref = section_relocations.get(&(symbol.st_shndx as usize));
             let symbol_ref = writer
-                .add_symbol(symbol.into(), sec_ref.cloned(), name, input)
-                .map_path_err(input)?;
+                .add_symbol(symbol.into(), sec_ref.cloned(), name, self.path)
+                .map_path_err(self.path)?;
             if let Some(sym) = symbol_ref {
                 symbols.insert(Symbol(symbol), sym);
             }
@@ -105,7 +102,7 @@ pub fn link<'p>(inputs: &'p [PathBuf], options: &'p crate::elf::Options) -> Resu
                 match rel.r_type {
                     R_X86_64_8 | R_X86_64_16 | R_X86_64_PC16 | R_X86_64_PC8 => {
                         return Err(Error::new(
-                            input,
+                            self.path,
                             format!("Relocation {} not conforming to ABI.", rel.r_type),
                         ));
                     }
@@ -122,13 +119,29 @@ pub fn link<'p>(inputs: &'p [PathBuf], options: &'p crate::elf::Options) -> Resu
                 }
             }
         }
-        elfs.push(Input { elf, section_relocations, symbols });
+        Ok(ProcessedObject { elf, section_relocations, symbols })
     }
+}
+
+pub fn link<'p>(inputs: &'p [PathBuf], options: &'p crate::elf::Options) -> Result<(), Error<'p>> {
+    let mut writer = elf::Writer::new(options).map_path_err(options.output.as_path())?;
+    let objects = inputs
+        .iter()
+        .map(|p| {
+            let path = p.as_path();
+            let data = read(path).map_path_err(path)?;
+            Ok(Object { data, path })
+        })
+        .collect::<Result<Vec<Object>, Error<'p>>>()?;
+    let elfs = objects
+        .iter()
+        .map(|o| o.process(&mut writer))
+        .collect::<Result<Vec<ProcessedObject<'_>>, Error<'p>>>()?;
     writer.compute_sections().map_path_err(options.output.as_path())?;
     for (i, elf, section_relocations, symbols) in
         elfs.iter().enumerate().map(|(i, e)| (i, &e.elf, &e.section_relocations, &e.symbols))
     {
-        log::debug!("Input: {}", inputs2[i].display());
+        log::debug!("Input: {}", inputs[i].display());
         for (section_index, rels) in &elf.shdr_relocs {
             // TODO: too much repetition
             for rel in rels.iter() {
