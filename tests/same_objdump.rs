@@ -8,7 +8,8 @@ fn same_objdump_as_ld() {
     let to_link = [PathBuf::from("./tests/obj-files/f.o"), PathBuf::from("./tests/obj-files/f2.o")];
     let file = NamedTempFile::new().unwrap();
 
-    dld::link(&to_link, file.path()).unwrap();
+    let options = dld::elf::Options::new(file.path().to_owned());
+    dld::link(&to_link, &options).unwrap();
     let objdump_output = Command::new("objdump").arg("-d").arg(file.path()).output().unwrap();
 
     // This is assuming `ld` is GNU ld for now

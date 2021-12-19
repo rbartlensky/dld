@@ -7,6 +7,7 @@ mod serialize;
 use byteorder::{LittleEndian, WriteBytesExt};
 use error::{Error, ErrorExt};
 use goblin::{
+    archive::Archive,
     elf::{reloc::*, sym::Sym, Elf},
     elf64::{
         header::EM_X86_64,
@@ -63,11 +64,30 @@ pub struct ProcessedObject<'e> {
 }
 
 impl<'o> Object<'o> {
-    pub fn process<'e>(
+    fn process<'e>(
         &'e self,
         writer: &mut elf::Writer<'o>,
+    ) -> Result<Vec<ProcessedObject<'e>>, Error<'o>> {
+        if let Ok(ar) = Archive::parse(&self.data) {
+            let mut pobjects = Vec::with_capacity(ar.len());
+            for i in 0..ar.len() {
+                let member = ar.get_at(i).unwrap();
+                let offset = member.offset as usize;
+                let data = &self.data[offset..offset + member.size()];
+                pobjects.push(self.process_elf(data, writer)?);
+            }
+            Ok(pobjects)
+        } else {
+            Ok(vec![self.process_elf(&self.data, writer)?])
+        }
+    }
+
+    fn process_elf<'e>(
+        &'e self,
+        data: &'e [u8],
+        writer: &mut elf::Writer<'o>,
     ) -> Result<ProcessedObject<'e>, Error<'o>> {
-        let elf = Elf::parse(&self.data).map_path_err(self.path)?;
+        let elf = Elf::parse(data).map_path_err(self.path)?;
         let mut section_relocations = HashMap::new();
         let mut symbols = HashMap::new();
         for (i, section) in elf
@@ -136,7 +156,10 @@ pub fn link<'p>(inputs: &'p [PathBuf], options: &'p crate::elf::Options) -> Resu
     let elfs = objects
         .iter()
         .map(|o| o.process(&mut writer))
-        .collect::<Result<Vec<ProcessedObject<'_>>, Error<'p>>>()?;
+        .collect::<Result<Vec<Vec<ProcessedObject<'_>>>, Error<'p>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<ProcessedObject<'_>>>();
     writer.compute_sections().map_path_err(options.output.as_path())?;
     for (i, elf, section_relocations, symbols) in
         elfs.iter().enumerate().map(|(i, e)| (i, &e.elf, &e.section_relocations, &e.symbols))

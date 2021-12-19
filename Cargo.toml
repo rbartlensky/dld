@@ -9,7 +9,7 @@ edition = "2018"
 [dependencies]
 byteorder = "1.4.3"
 # would be nice to get rid of elf32: https://github.com/m4b/goblin/issues/212
-goblin = { version = "0.4", features = ["elf32", "elf64", "endian_fd", "std"], default-features = false }
+goblin = { version = "0.4", features = ["archive", "elf32", "elf64", "endian_fd", "std"], default-features = false }
 thiserror = "1.0"
 log = "0.4"
 env_logger = "0.9"
