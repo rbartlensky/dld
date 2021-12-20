@@ -1,6 +1,7 @@
 use byteorder::{LittleEndian, WriteBytesExt};
 use goblin::elf64::{
-    header::Header, program_header::ProgramHeader, section_header::SectionHeader, sym::Sym,
+    header::Header, program_header::ProgramHeader, reloc::Rela, section_header::SectionHeader,
+    sym::Sym,
 };
 
 use std::{io::Write, mem::size_of};
@@ -78,6 +79,15 @@ impl<W: Write> Serialize<W> for Name {
         buf.write_all(self.as_bytes()).unwrap();
         buf.write_u8(0).unwrap();
         self.as_bytes().len() + 1
+    }
+}
+
+impl<W: Write> Serialize<W> for Rela {
+    fn serialize(&self, buf: &mut W) -> usize {
+        buf.write_u64::<LittleEndian>(self.r_offset).unwrap();
+        buf.write_u64::<LittleEndian>(self.r_info).unwrap();
+        buf.write_i64::<LittleEndian>(self.r_addend).unwrap();
+        size_of::<Rela>()
     }
 }
 

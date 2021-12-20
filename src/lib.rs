@@ -11,6 +11,7 @@ use goblin::{
     elf::{reloc::*, sym::Sym, Elf},
     elf64::{
         header::EM_X86_64,
+        reloc::Rela,
         section_header::{
             SHT_DYNAMIC, SHT_DYNSYM, SHT_REL, SHT_RELA, SHT_SHLIB, SHT_STRTAB, SHT_SYMTAB,
         },
@@ -22,6 +23,7 @@ use std::{
     fs::read,
     hash::{Hash, Hasher},
     io::Write,
+    mem::size_of,
     path::{Path, PathBuf},
 };
 
@@ -133,7 +135,8 @@ impl<'o> Object<'o> {
                     | R_X86_64_GOTOFF64
                     | R_X86_64_GOTPC32
                     | R_X86_64_GOTPCRELX
-                    | R_X86_64_REX_GOTPCRELX => writer.add_got_entry(symbols[&Symbol(*symbol)]),
+                    | R_X86_64_REX_GOTPCRELX
+                    | R_X86_64_TLSGD => writer.add_got_entry(symbols[&Symbol(*symbol)]),
                     R_X86_64_PLT32 => writer.add_plt_entry(symbols[&Symbol(*symbol)]),
                     x => unimplemented!("Relocation {}", r_to_str(x, EM_X86_64)),
                 }
@@ -166,7 +169,6 @@ pub fn link<'p>(inputs: &'p [PathBuf], options: &'p crate::elf::Options) -> Resu
     {
         log::debug!("Input: {}", inputs[i].display());
         for (section_index, rels) in &elf.shdr_relocs {
-            // TODO: too much repetition
             for rel in rels.iter() {
                 let symbol = &elf.syms.get(rel.r_sym as usize).unwrap();
                 let index = if let Some(sec) = section_relocations.get(&(section_index - 1)) {
@@ -189,7 +191,7 @@ pub fn link<'p>(inputs: &'p [PathBuf], options: &'p crate::elf::Options) -> Resu
                     rel,
                     r_to_str(rel.r_type, EM_X86_64)
                 );
-                apply_relocation(elf, &mut writer, *symbol, &rel, index);
+                apply_relocation(elf, &mut writer, *symbol, rel, index);
             }
         }
     }
@@ -210,7 +212,7 @@ fn apply_relocation(
     _elf: &Elf<'_>,
     writer: &mut crate::elf::Writer,
     symbol: crate::elf::SymbolRef,
-    rel: &Reloc,
+    mut rel: Reloc,
     section_index: crate::elf::SectionRef,
 ) {
     let symbol = writer.symbol(symbol);
@@ -291,6 +293,25 @@ fn apply_relocation(
                 let buf = writer.section_offset(section_index, rel.r_offset as usize);
                 buf[3..].as_mut().write_i32::<LittleEndian>(value).unwrap()
             };
+        }
+        R_X86_64_TLSGD => {
+            assert!(symbol.is_tls());
+            let got_offset = symbol.got_offset().unwrap();
+            for (got_offset, ty) in [
+                (got_offset, R_X86_64_DTPMOD64),
+                (got_offset + size_of::<u64>(), R_X86_64_DTPMOD64),
+            ] {
+                rel.r_offset = got_offset as u64;
+                rel.r_type = ty;
+                writer.add_relocation(
+                    ".got",
+                    Rela {
+                        r_offset: rel.r_offset,
+                        r_info: (rel.r_sym << 8) as u64 + rel.r_type as u64,
+                        r_addend: rel.r_addend.unwrap_or_default(),
+                    },
+                );
+            }
         }
         x => unimplemented!("Relocation {}", r_to_str(x, EM_X86_64)),
     }

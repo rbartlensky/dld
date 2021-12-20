@@ -1,16 +1,14 @@
 use crate::{error::ErrorType, name::Name, serialize::Serialize, symbol::Symbol};
 use byteorder::{LittleEndian, WriteBytesExt};
-use goblin::{
-    elf32::section_header::SHT_PROGBITS,
-    elf64::{
-        header::{Header, ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64, ET_EXEC, EV_CURRENT},
-        program_header::{ProgramHeader, PF_R, PF_W, PF_X, PT_LOAD},
-        section_header::{
-            SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_UNDEF,
-            SHT_NULL, SHT_STRTAB, SHT_SYMTAB,
-        },
-        sym::{Sym, STB_GLOBAL, STB_LOCAL},
+use goblin::elf64::{
+    header::{Header, ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64, ET_EXEC, EV_CURRENT},
+    program_header::{ProgramHeader, PF_R, PF_W, PF_X, PT_LOAD},
+    reloc::Rela,
+    section_header::{
+        SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_UNDEF,
+        SHT_NULL, SHT_PROGBITS, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
     },
+    sym::{Sym, STB_GLOBAL, STB_LOCAL},
 };
 use std::{
     cmp::Ordering,
@@ -81,7 +79,7 @@ pub struct Writer<'d> {
     symbol_names: StringTable,
     symbols: HashMap<u32, Vec<Symbol<'d>>>,
     sections: Vec<Section>,
-    got: HashMap<SymbolRef, usize>,
+    got_len: usize,
     plt: HashMap<SymbolRef, usize>,
     got_plt: HashMap<SymbolRef, usize>,
 }
@@ -120,7 +118,8 @@ impl<'d> Writer<'d> {
             symbol_names: Default::default(),
             symbols: Default::default(),
             sections: Default::default(),
-            got: Default::default(),
+            // first entry reserved
+            got_len: 1,
             plt: Default::default(),
             got_plt: Default::default(),
         };
@@ -191,6 +190,34 @@ impl<'d> Writer<'d> {
     ) -> SectionRef {
         let data = data.map(|v| v.to_owned());
         self.add_section(name, section, data)
+    }
+
+    pub fn add_relocation(&mut self, name: impl Into<Name>, r: Rela) {
+        let name = name.into();
+        let rela_name = format!(".rela{}", &*name);
+        let target_section = self.section_names.get(name).unwrap().index;
+        let entry = self.section_names.get_or_create(rela_name);
+        if entry.new {
+            let sh = SectionHeader {
+                sh_name: entry.offset as u32,
+                sh_type: SHT_RELA,
+                sh_size: size_of::<Rela>() as u64,
+                // TODO: the section header index of the associated symbol table.
+                sh_link: 0,
+                sh_info: target_section as u32,
+                sh_entsize: size_of::<Rela>() as u64,
+                ..Default::default()
+            };
+            let mut v = vec![0; size_of::<Rela>()];
+            r.serialize(&mut v);
+            self.sections.push(Section { sh, ph: None, data: v });
+        } else {
+            let section = &mut self.sections[entry.index];
+            section.sh.sh_size += size_of::<Rela>() as u64;
+            let mut v = vec![0; size_of::<Rela>()];
+            r.serialize(&mut v);
+            section.data.extend(v);
+        };
     }
 
     pub fn add_symbol<'s>(
@@ -264,10 +291,14 @@ impl<'d> Writer<'d> {
     }
 
     pub fn add_got_entry(&mut self, sym: SymbolRef) {
-        // first entry is reserved
-        let len = self.got.len() + 1;
-        let offset = *self.got.entry(sym).or_insert(len * size_of::<u64>());
-        self.symbols.get_mut(&sym.st_name).unwrap()[sym.index].set_got_offset(offset);
+        let sym = &mut self.symbols.get_mut(&sym.st_name).unwrap()[sym.index];
+        if sym.got_offset().is_none() {
+            sym.set_got_offset(self.got_len * size_of::<u64>());
+            // TLS symbols always take up two words in the got:
+            //  * module id
+            //  * and offset
+            self.got_len += if sym.is_tls() { 2 } else { 1 };
+        }
     }
 
     pub fn add_plt_entry(&mut self, sym: SymbolRef) {
@@ -291,9 +322,7 @@ impl<'d> Writer<'d> {
 
     fn compute_got(&mut self) {
         // [1] == .got
-        self.sections[1]
-            .data
-            .extend(std::iter::repeat(0).take(size_of::<u64>() * (self.got.len() + 1)));
+        self.sections[1].data.extend(std::iter::repeat(0).take(size_of::<u64>() * (self.got_len)));
         if let Some(e) = self.symbol_names.get("_GLOBAL_OFFSET_TABLE_") {
             let got_addr = self.got_address();
             self.symbols.entry(e.offset as u32).and_modify(|s| {

@@ -3,7 +3,10 @@ use std::{
     path::Path,
 };
 
-use goblin::elf64::sym::{Sym, STB_GLOBAL, STB_LOCAL, STB_WEAK};
+use goblin::{
+    elf32::sym::STT_TLS,
+    elf64::sym::{Sym, STB_GLOBAL, STB_LOCAL, STB_WEAK},
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Symbol<'r> {
@@ -23,12 +26,20 @@ impl<'r> Symbol<'r> {
         self.sym.st_info >> 4
     }
 
+    pub const fn st_type(&self) -> u8 {
+        self.sym.st_info & 0xf
+    }
+
     pub const fn is_global(&self) -> bool {
         self.st_bind() == STB_GLOBAL
     }
 
     pub const fn is_weak(&self) -> bool {
         self.st_bind() == STB_WEAK
+    }
+
+    pub const fn is_tls(&self) -> bool {
+        self.st_type() == STT_TLS
     }
 
     pub const fn is_local(&self) -> bool {
