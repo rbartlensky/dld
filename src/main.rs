@@ -150,7 +150,7 @@ fn search_for_libraries(args: &mut AppArgs) -> Result<(), &PathBuf> {
     for (lib, _) in &args.libs {
         let mut found = false;
         for dir in &args.search_paths {
-            for kind in ["a", "so"] {
+            for kind in ["so", "a"] {
                 let input = dir.join(format!("lib{}.{}", lib.display(), kind));
                 if input.exists() {
                     args.inputs.push(input);

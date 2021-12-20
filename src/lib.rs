@@ -54,42 +54,44 @@ impl Hash for Symbol {
     }
 }
 
-pub struct Object<'o> {
+pub struct Input<'o> {
     path: &'o Path,
     data: Vec<u8>,
 }
 
-pub struct ProcessedObject<'e> {
+pub struct Object<'e> {
     elf: Elf<'e>,
     section_relocations: HashMap<usize, elf::SectionRef>,
     symbols: HashMap<Symbol, elf::SymbolRef>,
 }
 
-impl<'o> Object<'o> {
-    fn process<'e>(
-        &'e self,
-        writer: &mut elf::Writer<'o>,
-    ) -> Result<Vec<ProcessedObject<'e>>, Error<'o>> {
+impl<'o> Input<'o> {
+    fn process<'e>(&'e self, writer: &mut elf::Writer<'o>) -> Result<Vec<Object<'e>>, Error<'o>> {
         if let Ok(ar) = Archive::parse(&self.data) {
             let mut pobjects = Vec::with_capacity(ar.len());
             for i in 0..ar.len() {
                 let member = ar.get_at(i).unwrap();
                 let offset = member.offset as usize;
                 let data = &self.data[offset..offset + member.size()];
-                pobjects.push(self.process_elf(data, writer)?);
+                let elf = Elf::parse(data).map_path_err(self.path)?;
+                pobjects.push(self.process_elf_object(elf, writer)?);
             }
             Ok(pobjects)
         } else {
-            Ok(vec![self.process_elf(&self.data, writer)?])
+            let elf = Elf::parse(&self.data).map_path_err(self.path)?;
+            if !elf.is_lib {
+                Ok(vec![self.process_elf_object(elf, writer)?])
+            } else {
+                Ok(vec![])
+            }
         }
     }
 
-    fn process_elf<'e>(
+    fn process_elf_object<'e>(
         &'e self,
-        data: &'e [u8],
+        elf: Elf<'e>,
         writer: &mut elf::Writer<'o>,
-    ) -> Result<ProcessedObject<'e>, Error<'o>> {
-        let elf = Elf::parse(data).map_path_err(self.path)?;
+    ) -> Result<Object<'e>, Error<'o>> {
         let mut section_relocations = HashMap::new();
         let mut symbols = HashMap::new();
         for (i, section) in elf
@@ -142,7 +144,7 @@ impl<'o> Object<'o> {
                 }
             }
         }
-        Ok(ProcessedObject { elf, section_relocations, symbols })
+        Ok(Object { elf, section_relocations, symbols })
     }
 }
 
@@ -153,16 +155,16 @@ pub fn link<'p>(inputs: &'p [PathBuf], options: &'p crate::elf::Options) -> Resu
         .map(|p| {
             let path = p.as_path();
             let data = read(path).map_path_err(path)?;
-            Ok(Object { data, path })
+            Ok(Input { data, path })
         })
-        .collect::<Result<Vec<Object>, Error<'p>>>()?;
+        .collect::<Result<Vec<Input>, Error<'p>>>()?;
     let elfs = objects
         .iter()
         .map(|o| o.process(&mut writer))
-        .collect::<Result<Vec<Vec<ProcessedObject<'_>>>, Error<'p>>>()?
+        .collect::<Result<Vec<Vec<Object<'_>>>, Error<'p>>>()?
         .into_iter()
         .flatten()
-        .collect::<Vec<ProcessedObject<'_>>>();
+        .collect::<Vec<Object<'_>>>();
     writer.compute_sections().map_path_err(options.output.as_path())?;
     for (i, elf, section_relocations, symbols) in
         elfs.iter().enumerate().map(|(i, e)| (i, &e.elf, &e.section_relocations, &e.symbols))
