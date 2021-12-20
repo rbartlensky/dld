@@ -243,8 +243,8 @@ impl<'d> Writer<'d> {
                 let mut found = None;
                 for (i, s) in syms.get_mut().iter_mut().enumerate() {
                     if s.is_global() {
-                        // we already found a definition for this symbol
-                        if s.st_shndx as u32 != SHN_UNDEF {
+                        // we found another definition for a global symbol
+                        if s.st_shndx as u32 != SHN_UNDEF && sym.st_shndx as u32 != SHN_UNDEF {
                             return Err(ErrorType::Other(format!(
                                 "Symbol {} already defined in {}",
                                 name,
