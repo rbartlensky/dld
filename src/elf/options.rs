@@ -87,19 +87,7 @@ pub struct Options {
     pub eh_frame_hdr: bool,
     pub emulation: Emulation,
     pub dynamic_linker: PathBuf,
-}
-
-impl Options {
-    pub fn new(output: PathBuf) -> Self {
-        Self {
-            output,
-            build_id: None,
-            hash_style: HashStyle::default(),
-            eh_frame_hdr: false,
-            emulation: Emulation::ElfX86_64,
-            dynamic_linker: PathBuf::new(),
-        }
-    }
+    pub shared_libs: Vec<(PathBuf, bool)>,
 }
 
 impl Default for Options {
@@ -111,6 +99,7 @@ impl Default for Options {
             eh_frame_hdr: false,
             emulation: Default::default(),
             dynamic_linker: PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
+            shared_libs: vec![],
         }
     }
 }

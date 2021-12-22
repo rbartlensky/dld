@@ -1,5 +1,11 @@
 use dld::elf::{BuildId, Emulation, HashStyle, Options};
-use std::{io::Read, path::PathBuf, str::FromStr};
+use goblin::elf32::header::ET_DYN;
+use std::{
+    collections::{HashMap, HashSet},
+    io::Read,
+    path::PathBuf,
+    str::FromStr,
+};
 
 mod linker_script;
 
@@ -29,10 +35,10 @@ OPTIONS:
 #[derive(Debug, Default)]
 struct AppArgs {
     opts: Options,
-    objects: Vec<PathBuf>,
-    search_paths: Vec<PathBuf>,
+    objects: HashSet<PathBuf>,
+    search_paths: HashSet<PathBuf>,
     scripts: Vec<PathBuf>,
-    libs: Vec<(PathBuf, bool)>,
+    inputs: HashMap<PathBuf, bool>,
     help: bool,
     as_needed: bool,
 }
@@ -45,16 +51,14 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
     while let Some(script) = args.scripts.pop() {
-        println!("script! {}", script.display());
-        let new_args =
-            linker_script::parse(&std::fs::read_to_string(script).unwrap()).unwrap();
+        let new_args = linker_script::parse(&std::fs::read_to_string(script).unwrap()).unwrap();
         if !new_args.is_empty() {
             handle_linker_args(&mut new_args.into_iter().peekable(), &mut args)?;
-            let _ = search_for_libraries(&mut args);
+            let _ = search_for_inputs(&mut args);
         }
     }
-    println!("{:#?}", args);
-    if let Err(e) = dld::link(&args.objects, &args.opts) {
+    log::debug!("{:#?}", args);
+    if let Err(e) = dld::link(&args.objects.into_iter().collect::<Vec<_>>(), &args.opts) {
         Err(format!("{}", e))
     } else {
         println!("Elf executable in: {}", args.opts.output.display());
@@ -65,19 +69,25 @@ fn main() -> Result<(), String> {
 #[derive(Debug)]
 enum FileType {
     Archive,
-    Elf,
+    ElfObject,
+    ElfSharedLib,
     Text,
 }
 
 fn file_type(input: &std::path::Path) -> std::io::Result<FileType> {
     let mut f = std::fs::File::open(&input)?;
-    let mut header = [0; 16];
-    f.read_exact(&mut header)?;
-    println!("{:?} : hdr: {:x?}", input, header);
+    let mut header = [0; 18];
+    if f.read_exact(&mut header).is_err() {
+        return Ok(FileType::Text);
+    }
     if header.starts_with(goblin::archive::MAGIC) {
         Ok(FileType::Archive)
     } else if header.starts_with(&[0x7f, b'E', b'L', b'F']) {
-        Ok(FileType::Elf)
+        if dbg!(header.ends_with(&[ET_DYN as u8, ((ET_DYN & 0xff00) >> 8) as u8])) {
+            Ok(FileType::ElfSharedLib)
+        } else {
+            Ok(FileType::ElfObject)
+        }
     } else {
         Ok(FileType::Text)
     }
@@ -88,7 +98,7 @@ fn parse_args() -> Result<AppArgs, String> {
     let _ = args.next();
     let mut app = Default::default();
     handle_linker_args(&mut args, &mut app)?;
-    search_for_libraries(&mut app).map_err(|e| format!("Couldn't find library {}", e.display()))?;
+    search_for_inputs(&mut app).map_err(|e| format!("Couldn't find library {}", e.display()))?;
     Ok(app)
 }
 
@@ -141,13 +151,13 @@ fn handle_linker_args(
             "-L" => {
                 let path =
                     args.next().ok_or_else(|| "Missing argument <PATH> for '-L'.".to_string())?;
-                app.search_paths.push(path.into());
+                app.search_paths.insert(path.into());
                 continue;
             }
             "-l" => {
                 let path =
                     args.next().ok_or_else(|| "Missing argument <PATH> for '-l'.".to_string())?;
-                app.libs.push((path.into(), app.as_needed));
+                app.inputs.insert(path.into(), app.as_needed);
                 continue;
             }
             "--as-needed" => {
@@ -163,21 +173,20 @@ fn handle_linker_args(
             }
         }
         if let Some(arg) = arg.strip_prefix("-L") {
-            app.search_paths.push(arg.into());
+            app.search_paths.insert(PathBuf::from(arg).canonicalize().unwrap());
         } else if let Some(lib) = arg.strip_prefix("-l") {
-            app.libs.push((lib.into(), app.as_needed));
+            app.inputs.insert(lib.into(), app.as_needed);
         } else if let Some(arg) = arg.strip_prefix("--hash-style=") {
             app.opts.hash_style = HashStyle::from_str(arg)?;
         } else {
-            app.libs.push((arg.into(), app.as_needed));
+            app.inputs.insert(arg.into(), app.as_needed);
         }
     }
     Ok(())
 }
 
-fn search_for_libraries(args: &mut AppArgs) -> Result<(), PathBuf> {
-    for (lib, _) in args.libs.drain(..) {
-        log::trace!("{}", lib.display());
+fn search_for_inputs(args: &mut AppArgs) -> Result<(), PathBuf> {
+    for (lib, as_needed) in args.inputs.drain() {
         let mut found = None;
         if lib.has_root() && lib.exists() && lib.is_file() {
             found = Some(lib.clone());
@@ -198,7 +207,10 @@ fn search_for_libraries(args: &mut AppArgs) -> Result<(), PathBuf> {
         if let Some(lib) = found.take() {
             let file_type = file_type(&lib).unwrap();
             match file_type {
-                FileType::Archive | FileType::Elf => args.objects.push(lib),
+                FileType::Archive | FileType::ElfObject => {
+                    args.objects.insert(lib.canonicalize().unwrap());
+                }
+                FileType::ElfSharedLib => args.opts.shared_libs.push((lib, as_needed)),
                 FileType::Text => args.scripts.push(lib),
             }
         } else {
