@@ -1,5 +1,7 @@
 use dld::elf::{BuildId, Emulation, HashStyle, Options};
-use std::{path::PathBuf, str::FromStr};
+use std::{io::Read, path::PathBuf, str::FromStr};
+
+mod linker_script;
 
 const HELP: &str = "dld 0.1.0
 
@@ -24,13 +26,15 @@ OPTIONS:
   --hash-style STYLE  Set hash style.
 ";
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct AppArgs {
     opts: Options,
-    inputs: Vec<PathBuf>,
+    objects: Vec<PathBuf>,
     search_paths: Vec<PathBuf>,
+    scripts: Vec<PathBuf>,
     libs: Vec<(PathBuf, bool)>,
     help: bool,
+    as_needed: bool,
 }
 
 fn main() -> Result<(), String> {
@@ -40,11 +44,17 @@ fn main() -> Result<(), String> {
         println!("{}", HELP);
         return Ok(());
     }
+    while let Some(script) = args.scripts.pop() {
+        println!("script! {}", script.display());
+        let new_args =
+            linker_script::parse(&std::fs::read_to_string(script).unwrap()).unwrap();
+        if !new_args.is_empty() {
+            handle_linker_args(&mut new_args.into_iter().peekable(), &mut args)?;
+            let _ = search_for_libraries(&mut args);
+        }
+    }
     println!("{:#?}", args);
-    search_for_libraries(&mut args)
-        .map_err(|e| format!("Couldn't find library: {}", e.display()))?;
-
-    if let Err(e) = dld::link(&args.inputs, &args.opts) {
+    if let Err(e) = dld::link(&args.objects, &args.opts) {
         Err(format!("{}", e))
     } else {
         println!("Elf executable in: {}", args.opts.output.display());
@@ -52,31 +62,51 @@ fn main() -> Result<(), String> {
     }
 }
 
+#[derive(Debug)]
+enum FileType {
+    Archive,
+    Elf,
+    Text,
+}
+
+fn file_type(input: &std::path::Path) -> std::io::Result<FileType> {
+    let mut f = std::fs::File::open(&input)?;
+    let mut header = [0; 16];
+    f.read_exact(&mut header)?;
+    println!("{:?} : hdr: {:x?}", input, header);
+    if header.starts_with(goblin::archive::MAGIC) {
+        Ok(FileType::Archive)
+    } else if header.starts_with(&[0x7f, b'E', b'L', b'F']) {
+        Ok(FileType::Elf)
+    } else {
+        Ok(FileType::Text)
+    }
+}
+
 fn parse_args() -> Result<AppArgs, String> {
     let mut args = std::env::args().peekable();
     let _ = args.next();
-    let mut build_id = None;
-    let mut hash_style = HashStyle::default();
-    let mut emulation = Emulation::default();
-    let mut output = PathBuf::from("./out");
-    let mut eh_frame_hdr = false;
-    let mut help = false;
-    let mut dynamic_linker = PathBuf::from("/lib64/ld-linux-x86-64.so.2");
-    let mut search_paths = vec![];
-    let mut libs = vec![];
-    let mut as_needed = false;
-    let mut inputs = vec![];
+    let mut app = Default::default();
+    handle_linker_args(&mut args, &mut app)?;
+    search_for_libraries(&mut app).map_err(|e| format!("Couldn't find library {}", e.display()))?;
+    Ok(app)
+}
+
+fn handle_linker_args(
+    args: &mut std::iter::Peekable<impl std::iter::Iterator<Item = String>>,
+    app: &mut AppArgs,
+) -> Result<(), String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--build-id" => {
                 if let Some(arg) = args.peek() {
                     if !arg.starts_with("--") && !arg.starts_with('-') {
-                        build_id = Some(BuildId::from_str(&args.next().unwrap())?);
+                        app.opts.build_id = Some(BuildId::from_str(&args.next().unwrap())?);
                     } else {
-                        build_id = Some(BuildId::default());
+                        app.opts.build_id = Some(BuildId::default());
                     }
                 } else {
-                    build_id = Some(BuildId::default());
+                    app.opts.build_id = Some(BuildId::default());
                 }
                 continue;
             }
@@ -84,48 +114,48 @@ fn parse_args() -> Result<AppArgs, String> {
                 let em = args
                     .next()
                     .ok_or_else(|| "Missing argument <EMULATION> for '-m'.".to_string())?;
-                emulation = Emulation::from_str(&em)?;
+                app.opts.emulation = Emulation::from_str(&em)?;
                 continue;
             }
             "-o" => {
                 let out =
                     args.next().ok_or_else(|| "Missing argument <OUTPUT> for '-o'.".to_string())?;
-                output = out.into();
+                app.opts.output = out.into();
                 continue;
             }
             "--eh-frame-hdr" => {
-                eh_frame_hdr = true;
+                app.opts.eh_frame_hdr = true;
                 continue;
             }
             "--help" | "-h" => {
-                help = true;
+                app.help = true;
                 continue;
             }
             "-dynamic-linker" => {
                 let linker = args
                     .next()
                     .ok_or_else(|| "Missing argument <PATH> for '-dynamic-linker'.".to_string())?;
-                dynamic_linker = linker.into();
+                app.opts.dynamic_linker = linker.into();
                 continue;
             }
             "-L" => {
                 let path =
                     args.next().ok_or_else(|| "Missing argument <PATH> for '-L'.".to_string())?;
-                search_paths.push(path.into());
+                app.search_paths.push(path.into());
                 continue;
             }
             "-l" => {
                 let path =
                     args.next().ok_or_else(|| "Missing argument <PATH> for '-l'.".to_string())?;
-                libs.push((path.into(), as_needed));
+                app.libs.push((path.into(), app.as_needed));
                 continue;
             }
             "--as-needed" => {
-                as_needed = true;
+                app.as_needed = true;
                 continue;
             }
             "--no-as-needed" => {
-                as_needed = false;
+                app.as_needed = false;
                 continue;
             }
             _ => {
@@ -133,33 +163,45 @@ fn parse_args() -> Result<AppArgs, String> {
             }
         }
         if let Some(arg) = arg.strip_prefix("-L") {
-            search_paths.push(arg.into());
+            app.search_paths.push(arg.into());
         } else if let Some(lib) = arg.strip_prefix("-l") {
-            libs.push((lib.into(), as_needed));
+            app.libs.push((lib.into(), app.as_needed));
         } else if let Some(arg) = arg.strip_prefix("--hash-style=") {
-            hash_style = HashStyle::from_str(arg)?;
+            app.opts.hash_style = HashStyle::from_str(arg)?;
         } else {
-            inputs.push(arg.into());
+            app.libs.push((arg.into(), app.as_needed));
         }
     }
-    let opts = Options { build_id, eh_frame_hdr, emulation, hash_style, dynamic_linker, output };
-    Ok(AppArgs { opts, help, search_paths, libs, inputs })
+    Ok(())
 }
 
-fn search_for_libraries(args: &mut AppArgs) -> Result<(), &PathBuf> {
-    for (lib, _) in &args.libs {
-        let mut found = false;
+fn search_for_libraries(args: &mut AppArgs) -> Result<(), PathBuf> {
+    for (lib, _) in args.libs.drain(..) {
+        log::trace!("{}", lib.display());
+        let mut found = None;
+        if lib.has_root() && lib.exists() && lib.is_file() {
+            found = Some(lib.clone());
+        }
         for dir in &args.search_paths {
+            let p = dir.join(&lib);
+            if p.exists() && p.is_file() {
+                found = Some(p);
+                break;
+            }
             for kind in ["so", "a"] {
                 let input = dir.join(format!("lib{}.{}", lib.display(), kind));
-                if input.exists() {
-                    args.inputs.push(input);
-                    found = true;
-                    break;
+                if input.exists() && input.is_file() {
+                    found = Some(input);
                 }
             }
         }
-        if !found {
+        if let Some(lib) = found.take() {
+            let file_type = file_type(&lib).unwrap();
+            match file_type {
+                FileType::Archive | FileType::Elf => args.objects.push(lib),
+                FileType::Text => args.scripts.push(lib),
+            }
+        } else {
             return Err(lib);
         }
     }
