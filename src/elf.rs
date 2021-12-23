@@ -290,14 +290,12 @@ impl<'d> Writer<'d> {
         &mut self.sections[section.index].data[offset..offset + size_of::<u64>()]
     }
 
-    pub fn add_got_entry(&mut self, sym: SymbolRef) {
+    pub fn add_got_entry(&mut self, sym: SymbolRef, r_type: u32) {
         let sym = &mut self.symbols.get_mut(&sym.st_name).unwrap()[sym.index];
         if sym.got_offset().is_none() {
             sym.set_got_offset(self.got_len * size_of::<u64>());
-            // TLS symbols always take up two words in the got:
-            //  * module id
-            //  * and offset
-            self.got_len += if sym.is_tls() { 2 } else { 1 };
+            // For TLSGD relocations we need to allocate two slots
+            self.got_len += if sym.is_tls() && r_type == R_X86_64_TLSGD { 2 } else { 1 };
         }
     }
 

@@ -131,14 +131,17 @@ impl<'o> Input<'o> {
                         ));
                     }
                     R_X86_64_32 | R_X86_64_32S | R_X86_64_NONE | R_X86_64_64 | R_X86_64_PC32
-                    | R_X86_64_SIZE64 => {}
+                    | R_X86_64_SIZE64 | R_X86_64_TPOFF32 => {}
                     R_X86_64_GOT32
                     | R_X86_64_GOTPCREL
                     | R_X86_64_GOTOFF64
                     | R_X86_64_GOTPC32
                     | R_X86_64_GOTPCRELX
                     | R_X86_64_REX_GOTPCRELX
-                    | R_X86_64_TLSGD => writer.add_got_entry(symbols[&Symbol(*symbol)]),
+                    | R_X86_64_TLSGD
+                    | R_X86_64_GOTTPOFF => {
+                        writer.add_got_entry(symbols[&Symbol(*symbol)], rel.r_type)
+                    }
                     R_X86_64_PLT32 => writer.add_plt_entry(symbols[&Symbol(*symbol)]),
                     x => unimplemented!("Relocation {}", r_to_str(x, EM_X86_64)),
                 }
@@ -214,7 +217,7 @@ fn apply_relocation(
     _elf: &Elf<'_>,
     writer: &mut crate::elf::Writer,
     symbol: crate::elf::SymbolRef,
-    mut rel: Reloc,
+    rel: Reloc,
     section_index: crate::elf::SectionRef,
 ) {
     let symbol = writer.symbol(symbol);
@@ -299,21 +302,42 @@ fn apply_relocation(
         R_X86_64_TLSGD => {
             assert!(symbol.is_tls());
             let got_offset = symbol.got_offset().unwrap();
+            let mut section_offset = writer.section_offset(section_index, rel.r_offset as usize);
+            let value = got_offset as i64 + got + a - p;
+            section_offset.write_i32::<LittleEndian>(value.try_into().unwrap()).unwrap();
             for (got_offset, ty) in [
                 (got_offset, R_X86_64_DTPMOD64),
                 (got_offset + size_of::<u64>(), R_X86_64_DTPMOD64),
             ] {
-                rel.r_offset = got_offset as u64;
-                rel.r_type = ty;
                 writer.add_relocation(
                     ".got",
                     Rela {
-                        r_offset: rel.r_offset,
-                        r_info: (rel.r_sym << 8) as u64 + rel.r_type as u64,
-                        r_addend: rel.r_addend.unwrap_or_default(),
+                        r_offset: got_offset as u64,
+                        r_info: (rel.r_sym << 8) as u64 + ty as u64,
+                        r_addend: 0,
                     },
                 );
             }
+        }
+        R_X86_64_GOTTPOFF => {
+            assert!(symbol.is_tls());
+            let got_offset = symbol.got_offset().unwrap();
+            let mut section_offset = writer.section_offset(section_index, rel.r_offset as usize);
+            let value = got_offset as i64 + got + a - p;
+            section_offset.write_i32::<LittleEndian>(value.try_into().unwrap()).unwrap();
+            writer.add_relocation(
+                ".got",
+                Rela {
+                    r_offset: (got_offset as i64 + got) as u64,
+                    r_info: (rel.r_sym << 8) as u64 + R_X86_64_TPOFF64 as u64,
+                    r_addend: 0,
+                },
+            );
+        }
+        R_X86_64_TPOFF32 => {
+            let mut section_offset = writer.section_offset(section_index, rel.r_offset as usize);
+            let value = s + a;
+            section_offset.write_i32::<LittleEndian>(value.try_into().unwrap()).unwrap();
         }
         x => unimplemented!("Relocation {}", r_to_str(x, EM_X86_64)),
     }

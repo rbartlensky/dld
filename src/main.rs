@@ -83,7 +83,7 @@ fn file_type(input: &std::path::Path) -> std::io::Result<FileType> {
     if header.starts_with(goblin::archive::MAGIC) {
         Ok(FileType::Archive)
     } else if header.starts_with(&[0x7f, b'E', b'L', b'F']) {
-        if dbg!(header.ends_with(&[ET_DYN as u8, ((ET_DYN & 0xff00) >> 8) as u8])) {
+        if header.ends_with(&[ET_DYN as u8, ((ET_DYN & 0xff00) >> 8) as u8]) {
             Ok(FileType::ElfSharedLib)
         } else {
             Ok(FileType::ElfObject)
