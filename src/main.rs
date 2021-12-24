@@ -191,13 +191,16 @@ fn search_for_inputs(args: &mut AppArgs) -> Result<(), PathBuf> {
         if lib.has_root() && lib.exists() && lib.is_file() {
             found = Some(lib.clone());
         }
-        for dir in &args.search_paths {
-            let p = dir.join(&lib);
-            if p.exists() && p.is_file() {
-                found = Some(p);
+        for kind in ["so", "a"] {
+            if found.is_some() {
                 break;
             }
-            for kind in ["so", "a"] {
+            for dir in &args.search_paths {
+                let p = dir.join(&lib);
+                if p.exists() && p.is_file() {
+                    found = Some(p);
+                    break;
+                }
                 let input = dir.join(format!("lib{}.{}", lib.display(), kind));
                 if input.exists() && input.is_file() {
                     found = Some(input);
