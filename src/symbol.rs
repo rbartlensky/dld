@@ -73,6 +73,18 @@ impl<'r> Symbol<'r> {
     pub fn set_plt_index(&mut self, index: usize) {
         self.in_plt = Some(index);
     }
+
+    pub fn higher_bind_than(&self, sym: Symbol<'_>) -> bool {
+        let s1 = self.st_bind();
+        let s2 = sym.st_bind();
+        match (s1, s2) {
+            (STB_LOCAL, STB_LOCAL)
+            | (STB_LOCAL, STB_WEAK)
+            | (STB_LOCAL, STB_GLOBAL)
+            | (STB_WEAK, STB_GLOBAL) => false,
+            _ => true,
+        }
+    }
 }
 
 impl PartialEq for Symbol<'_> {

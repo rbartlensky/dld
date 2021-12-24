@@ -3,7 +3,7 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use goblin::elf64::{
     header::{Header, ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64, ET_EXEC, EV_CURRENT},
     program_header::{ProgramHeader, PF_R, PF_W, PF_X, PT_LOAD},
-    reloc::Rela,
+    reloc::{Rela, R_X86_64_TLSGD},
     section_header::{
         SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_UNDEF,
         SHT_NULL, SHT_PROGBITS, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
@@ -77,7 +77,7 @@ pub struct Writer<'d> {
     eh: Header,
     section_names: StringTable,
     symbol_names: StringTable,
-    symbols: HashMap<u32, Vec<Symbol<'d>>>,
+    symbols: HashMap<u32, Symbol<'d>>,
     sections: Vec<Section>,
     got_len: usize,
     plt: HashMap<SymbolRef, usize>,
@@ -237,52 +237,46 @@ impl<'d> Writer<'d> {
         } else if ![SHN_ABS, SHN_COMMON, SHN_UNDEF].contains(&(elf_sym.st_shndx as u32)) {
             return Ok(None);
         }
-        let sym = Symbol::new(elf_sym, reference);
-        let index = match self.symbols.entry(st_name) {
-            Entry::Occupied(mut syms) => {
-                let mut found = None;
-                for (i, s) in syms.get_mut().iter_mut().enumerate() {
-                    if s.is_global() {
-                        // we found another definition for a global symbol
-                        if s.st_shndx as u32 != SHN_UNDEF && sym.st_shndx as u32 != SHN_UNDEF {
-                            return Err(ErrorType::Other(format!(
-                                "Symbol {} already defined in {}",
-                                name,
-                                s.reference().display()
-                            )));
-                        } else if sym.st_shndx as u32 != SHN_UNDEF {
-                            // if we find the same global symbol in another
-                            // lib that points to a valid section, we can steal
-                            // that symbol to make it defined
-                            *s = sym;
-                            found = Some(i);
-                        } else {
-                            // found the same undefined symbol twice, no need to duplicate it
-                            found = Some(i);
-                        }
-                    } else if !s.is_weak() {
-                        // if we already have a local symbol with the same name, pointing to
-                        // the same section, then there is no need to include it anymore
-                        if same_local_symbol(&s.sym, &sym.sym) {
-                            found = Some(i);
-                        };
-                    }
+        let new_sym = Symbol::new(elf_sym, reference);
+        match self.symbols.entry(st_name) {
+            Entry::Occupied(mut s) => {
+                let old_sym = &mut s.get_mut();
+                // we found another definition of this global symbol
+                if old_sym.is_global()
+                    && new_sym.is_global()
+                    && old_sym.st_shndx != SHN_UNDEF as u16
+                    && new_sym.st_shndx != SHN_UNDEF as u16
+                {
+                    log::trace!(
+                        "Old defition: {:#?} vs new definition: {:#?}",
+                        old_sym.sym,
+                        new_sym.sym
+                    );
+                    return Err(ErrorType::Other(format!(
+                        "Symbol {} already defined in {}",
+                        name,
+                        old_sym.reference().display()
+                    )));
                 }
-                found.unwrap_or_else(|| {
-                    syms.get_mut().push(sym);
-                    syms.get_mut().len() - 1
-                })
+                if !old_sym.higher_bind_than(new_sym) {
+                    old_sym.st_info = new_sym.st_info;
+                    old_sym.st_other = new_sym.st_other;
+                    old_sym.st_shndx = new_sym.st_shndx;
+                    old_sym.st_value = new_sym.st_value;
+                    old_sym.st_size = new_sym.st_size;
+                } else if old_sym.st_shndx == SHN_UNDEF as u16 {
+                    old_sym.st_shndx = new_sym.st_shndx;
+                }
             }
             Entry::Vacant(v) => {
-                v.insert(vec![sym]);
-                0
+                v.insert(new_sym);
             }
-        };
-        Ok(Some(SymbolRef { st_name, index }))
+        }
+        Ok(Some(SymbolRef { st_name, index: 0 }))
     }
 
     pub fn symbol(&self, sym: SymbolRef) -> Symbol<'_> {
-        self.symbols[&sym.st_name][sym.index]
+        self.symbols[&sym.st_name]
     }
 
     pub fn section_offset(&mut self, section: SectionRef, offset: usize) -> &mut [u8] {
@@ -291,7 +285,7 @@ impl<'d> Writer<'d> {
     }
 
     pub fn add_got_entry(&mut self, sym: SymbolRef, r_type: u32) {
-        let sym = &mut self.symbols.get_mut(&sym.st_name).unwrap()[sym.index];
+        let sym = &mut self.symbols.get_mut(&sym.st_name).unwrap();
         if sym.got_offset().is_none() {
             sym.set_got_offset(self.got_len * size_of::<u64>());
             // For TLSGD relocations we need to allocate two slots
@@ -305,7 +299,7 @@ impl<'d> Writer<'d> {
         let len = self.got_plt.len() + 3;
         let offset = *self.got_plt.entry(sym).or_insert(len * size_of::<u64>());
 
-        let sym = &mut self.symbols.get_mut(&sym.st_name).unwrap()[sym.index];
+        let sym = &mut self.symbols.get_mut(&sym.st_name).unwrap();
         sym.set_got_plt_offset(offset);
         sym.set_plt_index(index);
     }
@@ -325,8 +319,8 @@ impl<'d> Writer<'d> {
             let got_addr = self.got_address();
             self.symbols.entry(e.offset as u32).and_modify(|s| {
                 // 1 == .got section
-                s[0].st_shndx = 1;
-                s[0].st_value = got_addr
+                s.st_shndx = 1;
+                s.st_value = got_addr
             });
         }
     }
@@ -343,7 +337,7 @@ impl<'d> Writer<'d> {
         let plt_address = self.plt_address();
         // [2] == .got.plt
         for (sym, addr) in &self.got_plt {
-            let sym = &self.symbols[&sym.st_name][sym.index];
+            let sym = &self.symbols[&sym.st_name];
             // 16 to skip the header, another 16 for all entries before plt_index, and then another 11
             let plt_index = sym.plt_index().unwrap();
             self.sections[2].data[*addr..]
@@ -376,7 +370,7 @@ impl<'d> Writer<'d> {
         }
         for (symbol_ref, plt_index) in &self.plt {
             let entry = &mut self.sections[3].data[16 * (plt_index + 1)..];
-            let sym = &self.symbols[&symbol_ref.st_name][symbol_ref.index];
+            let sym = &self.symbols[&symbol_ref.st_name];
             let got_plt_offset = sym.got_plt_offset().unwrap().try_into().unwrap();
             let plt_index: u32 = (*plt_index).try_into().unwrap();
             entry[2..].as_mut().write_u32::<LittleEndian>(got_plt_offset).unwrap();
@@ -408,8 +402,7 @@ impl<'d> Writer<'d> {
         let mut shoff = (size_of::<Header>()
             + self.section_names.total_len()
             + self.symbol_names.total_len()
-            + self.symbols.values().flatten().count() * size_of::<Sym>())
-            as u64;
+            + self.symbols.values().count() * size_of::<Sym>()) as u64;
         for section in &mut self.sections {
             shoff += section.data_size();
             self.eh.e_phnum += section.ph.map(|_| 1).unwrap_or_default();
@@ -444,8 +437,7 @@ impl<'d> Writer<'d> {
         // write the symbols to disk and make sure that locals come first
         let mut section = vec![];
         let mut section_len = 0;
-        let mut syms: Vec<&mut Sym> =
-            self.symbols.values_mut().flatten().map(|s| &mut s.sym).collect();
+        let mut syms: Vec<&mut Sym> = self.symbols.values_mut().map(|s| &mut s.sym).collect();
         syms.sort_by(|s1, s2| sort_symbols_func(s1, s2));
         let mut undefined_symbols = vec![];
         let mut last_local = 0;
@@ -592,14 +584,6 @@ fn get_program_header(sh: &SectionHeader) -> Option<ProgramHeader> {
     } else {
         None
     }
-}
-
-pub(crate) fn same_local_symbol(s1: &Sym, s2: &Sym) -> bool {
-    s1.st_name == s2.st_name
-        && s1.st_info == s2.st_info
-        && s1.st_other == s2.st_other
-        && s1.st_shndx == s2.st_shndx
-        && s1.st_size == s2.st_size
 }
 
 fn format_list(v: &[String]) -> String {

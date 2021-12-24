@@ -74,12 +74,14 @@ impl<'o> Input<'o> {
                 let offset = member.offset as usize;
                 let data = &self.data[offset..offset + member.size()];
                 let elf = Elf::parse(data).map_path_err(self.path)?;
-                pobjects.push(self.process_elf_object(elf, writer)?);
+                if elf.is_object_file() {
+                    pobjects.push(self.process_elf_object(elf, writer)?);
+                }
             }
             Ok(pobjects)
         } else {
             let elf = Elf::parse(&self.data).map_path_err(self.path)?;
-            if !elf.is_lib {
+            if elf.is_object_file() {
                 Ok(vec![self.process_elf_object(elf, writer)?])
             } else {
                 Ok(vec![])
