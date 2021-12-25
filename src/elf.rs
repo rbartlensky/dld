@@ -394,6 +394,24 @@ impl<'d> Writer<'d> {
         }
     }
 
+    fn handle_special_symbols(&mut self) {
+        // TODO: handle more edge cases
+        if let Some(section_entry) = self.section_names.get(".init_array") {
+            let init_array_start = self.symbol_names.get("__init_array_start");
+            let init_array_end = self.symbol_names.get("__init_array_end");
+            if let (Some(start), Some(end)) = (init_array_start, init_array_end) {
+                let section = &self.sections[section_entry.index];
+                let size = section.sh.sh_size;
+                let addr = section.sh.sh_addr;
+                for (s, v) in [(start, addr), (end, addr + size)] {
+                    let sym = self.symbols.get_mut(&(s.offset as u32)).unwrap();
+                    sym.st_shndx = section_entry.index as u16;
+                    sym.st_value = v
+                }
+            }
+        }
+    }
+
     // elf header
     // section 1
     // section 2
@@ -446,6 +464,8 @@ impl<'d> Writer<'d> {
                 file_offset += section.data.len() as u64;
             }
         }
+
+        self.handle_special_symbols();
 
         // write the symbols to disk and make sure that locals come first
         let mut section = vec![];
