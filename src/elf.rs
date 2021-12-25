@@ -205,7 +205,7 @@ impl<'d> Writer<'d> {
                 sh_name: entry.offset as u32,
                 sh_type: SHT_RELA,
                 sh_size: size_of::<Rela>() as u64,
-                // TODO: the section header index of the associated symbol table.
+                // patched later when we know where our symbol table is
                 sh_link: 0,
                 sh_info: target_section as u32,
                 sh_entsize: size_of::<Rela>() as u64,
@@ -504,6 +504,10 @@ impl<'d> Writer<'d> {
                 section.align_and_extend_data();
                 file_offset += section.data.len() as u64;
             }
+            if self.section_names.name(section.sh.sh_name as usize).unwrap().starts_with(".rel") {
+                // the symbol table is the last section
+                section.sh.sh_link = self.eh.e_shnum as u32;
+            }
         }
 
         self.handle_special_symbols();
@@ -521,8 +525,8 @@ impl<'d> Writer<'d> {
                 let name = self.symbol_names.name(sym.st_name as usize).unwrap().to_string();
                 if self.dyn_symbol_names.get(name.clone()).is_none() {
                     undefined_symbols.push(name);
+                    continue;
                 }
-                continue;
             }
             // since we now have an address for our sections, we can patch the
             // final value of all symbols
@@ -602,12 +606,17 @@ impl<'d> Writer<'d> {
     }
 
     pub fn write_to_disk(mut self) {
-        self.eh.serialize(&mut self.out);
-        for section in &self.sections {
+        let mut offset = 0;
+        log::trace!("{:x}: ---- elf header ----\n{:#?}", offset, self.eh);
+        offset += self.eh.serialize(&mut self.out);
+        for (i, section) in self.sections.iter().enumerate() {
+            log::trace!("{:x}: ---- section {} ----", offset, i);
             self.out.write_all(&section.data).unwrap();
+            offset +=  section.data.len();
         }
-        for section in &self.sections {
-            section.sh.serialize(&mut self.out);
+        for (i, section) in self.sections.iter().enumerate() {
+            log::trace!("{:x}: ---- section {} ----\n{:#?}", offset, i, section.sh);
+            offset += section.sh.serialize(&mut self.out);
         }
         for section in self.sections {
             if let Some(ph) = section.ph {

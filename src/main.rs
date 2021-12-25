@@ -193,7 +193,7 @@ fn handle_linker_args(
 fn search_for_inputs(args: &mut AppArgs) -> Result<(), PathBuf> {
     for (lib, as_needed) in args.inputs.drain() {
         let mut found = None;
-        if lib.has_root() && lib.exists() && lib.is_file() {
+        if lib.exists() && lib.is_file() {
             found = Some(lib.clone());
         }
         for kind in ["so", "a"] {

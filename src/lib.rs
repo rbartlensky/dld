@@ -298,6 +298,11 @@ fn apply_relocation(
             let mut section_offset = writer.section_offset(section_index, rel.r_offset as usize);
             section_offset.write_i32::<LittleEndian>((s + a).try_into().unwrap()).unwrap()
         }
+        R_X86_64_32S => {
+            let mut section_offset = writer.section_offset(section_index, rel.r_offset as usize);
+            // TODO warn about truncation
+            section_offset.write_i32::<LittleEndian>((s + a) as i32).unwrap()
+        }
         R_X86_64_PC32 => {
             let mut section_offset = writer.section_offset(section_index, rel.r_offset as usize);
             section_offset.write_i32::<LittleEndian>((s + a - p).try_into().unwrap()).unwrap()
