@@ -41,7 +41,6 @@ pub struct SectionRef {
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct SymbolRef {
     pub st_name: u32,
-    pub index: usize,
 }
 
 struct Section {
@@ -272,11 +271,25 @@ impl<'d> Writer<'d> {
                 v.insert(new_sym);
             }
         }
-        Ok(Some(SymbolRef { st_name, index: 0 }))
+        Ok(Some(SymbolRef { st_name }))
     }
 
     pub fn symbol(&self, sym: SymbolRef) -> Symbol<'_> {
         self.symbols[&sym.st_name]
+    }
+
+    pub fn symbol_name(&self, sym: SymbolRef) -> &str {
+        &self.symbol_names.name(sym.st_name as usize).unwrap()
+    }
+
+    pub fn undefined_symbols(&self) -> Vec<SymbolRef> {
+        let mut undefined = vec![];
+        for (st_name, sym) in &self.symbols {
+            if sym.st_shndx as u32 == SHN_UNDEF && sym.st_bind() == STB_GLOBAL {
+                undefined.push(SymbolRef { st_name: *st_name });
+            }
+        }
+        undefined
     }
 
     pub fn section_offset(&mut self, section: SectionRef, offset: usize) -> &mut [u8] {

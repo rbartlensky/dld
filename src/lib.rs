@@ -18,7 +18,7 @@ use goblin::{
     },
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::TryInto,
     fs::read,
     hash::{Hash, Hasher},
@@ -66,144 +66,171 @@ pub struct Object<'e> {
 }
 
 impl<'o> Input<'o> {
-    fn process<'e>(&'e self, writer: &mut elf::Writer<'o>) -> Result<Vec<Object<'e>>, Error<'o>> {
-        if let Ok(ar) = Archive::parse(&self.data) {
-            let mut pobjects = Vec::with_capacity(ar.len());
-            for i in 0..ar.len() {
-                let member = ar.get_at(i).unwrap();
-                let offset = member.offset as usize;
-                let data = &self.data[offset..offset + member.size()];
-                let elf = Elf::parse(data).map_path_err(self.path)?;
-                if elf.is_object_file() {
-                    pobjects.push(self.process_elf_object(elf, writer)?);
-                }
-            }
-            Ok(pobjects)
-        } else {
-            let elf = Elf::parse(&self.data).map_path_err(self.path)?;
-            if elf.is_object_file() {
-                Ok(vec![self.process_elf_object(elf, writer)?])
-            } else {
-                Ok(vec![])
-            }
-        }
-    }
-
-    fn process_elf_object<'e>(
+    fn process<'e>(
         &'e self,
-        elf: Elf<'e>,
         writer: &mut elf::Writer<'o>,
-    ) -> Result<Object<'e>, Error<'o>> {
-        let mut section_relocations = HashMap::new();
-        let mut symbols = HashMap::new();
-        for (i, section) in elf
-            .section_headers
-            .iter()
-            .enumerate()
-            .filter(|(_, sh)| !SKIPPED_SECTIONS.contains(&sh.sh_type))
-        {
-            let name = get_section_name(&elf, section.sh_name).map_path_err(self.path)?;
-            let section_ref = writer.push_section(
-                name.to_owned(),
-                section,
-                section.file_range().map(|r| &self.data[r]),
-            );
-            log::trace!("Section '{}:{}' of {:?} mapped to {:?}", i, name, self.path, section_ref);
-            section_relocations.insert(i, section_ref);
+    ) -> Result<Option<Object<'e>>, Error<'o>> {
+        let elf = Elf::parse(&self.data).map_path_err(self.path)?;
+        if elf.is_object_file() {
+            Ok(Some(process_elf_object(self.path, &self.data, elf, writer)?))
+        } else {
+            Ok(None)
         }
-        for symbol in &elf.syms {
-            let name = get_symbol_name(&elf, symbol.st_name).map_path_err(self.path)?;
-            let sec_ref = section_relocations.get(&(symbol.st_shndx as usize));
-            let symbol_ref = writer
-                .add_symbol(symbol.into(), sec_ref.cloned(), name, self.path)
-                .map_path_err(self.path)?;
-            if let Some(sym) = symbol_ref {
-                symbols.insert(Symbol(symbol), sym);
-            }
-        }
-        // just scan relocs for now to find out how many GOT entries we have
-        for (_, rels) in &elf.shdr_relocs {
-            for rel in rels.iter().filter(|r| r.r_sym != 0) {
-                let symbol = &elf.syms.get(rel.r_sym as usize).unwrap();
-                match rel.r_type {
-                    R_X86_64_8 | R_X86_64_16 | R_X86_64_PC16 | R_X86_64_PC8 => {
-                        return Err(Error::new(
-                            self.path,
-                            format!("Relocation {} not conforming to ABI.", rel.r_type),
-                        ));
-                    }
-                    R_X86_64_32 | R_X86_64_32S | R_X86_64_NONE | R_X86_64_64 | R_X86_64_PC32
-                    | R_X86_64_SIZE64 | R_X86_64_TPOFF32 => {}
-                    R_X86_64_GOT32
-                    | R_X86_64_GOTPCREL
-                    | R_X86_64_GOTOFF64
-                    | R_X86_64_GOTPC32
-                    | R_X86_64_GOTPCRELX
-                    | R_X86_64_REX_GOTPCRELX
-                    | R_X86_64_TLSGD
-                    | R_X86_64_GOTTPOFF => {
-                        writer.add_got_entry(symbols[&Symbol(*symbol)], rel.r_type)
-                    }
-                    R_X86_64_PLT32 => writer.add_plt_entry(symbols[&Symbol(*symbol)]),
-                    x => unimplemented!("Relocation {}", r_to_str(x, EM_X86_64)),
-                }
-            }
-        }
-        Ok(Object { elf, section_relocations, symbols })
     }
 }
 
-pub fn link<'p>(inputs: &'p [PathBuf], options: &'p crate::elf::Options) -> Result<(), Error<'p>> {
-    let mut writer = elf::Writer::new(options).map_path_err(options.output.as_path())?;
-    let objects = inputs
+fn process_elf_object<'e, 'o>(
+    path: &'o Path,
+    data: &'e [u8],
+    elf: Elf<'e>,
+    writer: &mut elf::Writer<'o>,
+) -> Result<Object<'e>, Error<'o>> {
+    let mut section_relocations = HashMap::new();
+    let mut symbols = HashMap::new();
+    for (i, section) in elf
+        .section_headers
         .iter()
-        .map(|p| {
-            let path = p.as_path();
-            let data = read(path).map_path_err(path)?;
-            Ok(Input { data, path })
-        })
-        .collect::<Result<Vec<Input>, Error<'p>>>()?;
-    let elfs = objects
-        .iter()
-        .map(|o| o.process(&mut writer))
-        .collect::<Result<Vec<Vec<Object<'_>>>, Error<'p>>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<Object<'_>>>();
-    writer.compute_sections().map_path_err(options.output.as_path())?;
-    for (i, elf, section_relocations, symbols) in
-        elfs.iter().enumerate().map(|(i, e)| (i, &e.elf, &e.section_relocations, &e.symbols))
+        .enumerate()
+        .filter(|(_, sh)| !SKIPPED_SECTIONS.contains(&sh.sh_type))
     {
-        log::debug!("Input: {}", inputs[i].display());
-        for (section_index, rels) in &elf.shdr_relocs {
-            for rel in rels.iter() {
-                let symbol = &elf.syms.get(rel.r_sym as usize).unwrap();
-                let index = if let Some(sec) = section_relocations.get(&(section_index - 1)) {
-                    *sec
-                } else {
-                    continue;
-                };
-                let symbol = if let Some(sym) = symbols.get(&Symbol(*symbol)) {
-                    sym
-                } else {
-                    log::trace!(
-                        "discarded relocation due to missing symbol {:?} type: {}",
-                        rel,
-                        r_to_str(rel.r_type, EM_X86_64)
-                    );
-                    continue;
-                };
-                log::trace!(
-                    "applying relocation {:?} type: {}",
-                    rel,
-                    r_to_str(rel.r_type, EM_X86_64)
-                );
-                apply_relocation(elf, &mut writer, *symbol, rel, index);
+        let name = get_section_name(&elf, section.sh_name).map_path_err(path)?;
+        let section_ref =
+            writer.push_section(name.to_owned(), section, section.file_range().map(|r| &data[r]));
+        log::trace!("Section '{}:{}' of {:?} mapped to {:?}", i, name, path, section_ref);
+        section_relocations.insert(i, section_ref);
+    }
+    for symbol in &elf.syms {
+        let name = get_symbol_name(&elf, symbol.st_name).map_path_err(path)?;
+        let sec_ref = section_relocations.get(&(symbol.st_shndx as usize));
+        let symbol_ref =
+            writer.add_symbol(symbol.into(), sec_ref.cloned(), name, path).map_path_err(path)?;
+        if let Some(sym) = symbol_ref {
+            symbols.insert(Symbol(symbol), sym);
+        }
+    }
+    // just scan relocs for now to find out how many GOT entries we have
+    for (_, rels) in &elf.shdr_relocs {
+        for rel in rels.iter().filter(|r| r.r_sym != 0) {
+            let symbol = &elf.syms.get(rel.r_sym as usize).unwrap();
+            match rel.r_type {
+                R_X86_64_8 | R_X86_64_16 | R_X86_64_PC16 | R_X86_64_PC8 => {
+                    return Err(Error::new(
+                        path,
+                        format!("Relocation {} not conforming to ABI.", rel.r_type),
+                    ));
+                }
+                R_X86_64_32 | R_X86_64_32S | R_X86_64_NONE | R_X86_64_64 | R_X86_64_PC32
+                | R_X86_64_SIZE64 | R_X86_64_TPOFF32 => {}
+                R_X86_64_GOT32
+                | R_X86_64_GOTPCREL
+                | R_X86_64_GOTOFF64
+                | R_X86_64_GOTPC32
+                | R_X86_64_GOTPCRELX
+                | R_X86_64_REX_GOTPCRELX
+                | R_X86_64_TLSGD
+                | R_X86_64_GOTTPOFF => writer.add_got_entry(symbols[&Symbol(*symbol)], rel.r_type),
+                R_X86_64_PLT32 => writer.add_plt_entry(symbols[&Symbol(*symbol)]),
+                x => unimplemented!("Relocation {}", r_to_str(x, EM_X86_64)),
             }
         }
     }
-    writer.write_to_disk();
-    Ok(())
+    Ok(Object { elf, section_relocations, symbols })
+}
+
+pub struct Linker {
+    pub options: crate::elf::Options,
+    pub objects: HashSet<PathBuf>,
+    pub archives: HashSet<PathBuf>,
+}
+
+impl Linker {
+    fn process_archives_containing<'o>(
+        &'o self,
+        writer: &mut elf::Writer<'o>,
+    ) -> Result<(), Error<'o>> {
+        let mut undefines = writer
+            .undefined_symbols()
+            .into_iter()
+            .map(|s| (s, false))
+            .collect::<HashMap<elf::SymbolRef, bool>>();
+        for ar in &self.archives {
+            let path = ar.as_path();
+            let data = read(path).map_path_err(path)?;
+            let ar = Archive::parse(&data).map_path_err(path)?;
+            let mut members = HashSet::new();
+            for entry in &mut undefines {
+                let name = writer.symbol_name(*entry.0);
+                if let Some(member) = ar.member_of_symbol(name) {
+                    *entry.1 = true;
+                    members.insert(member);
+                }
+            }
+            for member in members {
+                let object = ar.get(member).unwrap();
+                let object_data =
+                    &data[(object.offset as usize)..(object.offset as usize + object.size())];
+                let elf = Elf::parse(&object_data).unwrap();
+                process_elf_object(path, object_data, elf, writer)?;
+            }
+            undefines.retain(|_, found| !*found);
+        }
+        Ok(())
+    }
+
+    pub fn link(&self) -> Result<(), Error<'_>> {
+        let mut writer =
+            elf::Writer::new(&self.options).map_path_err(self.options.output.as_path())?;
+        let objects = self
+            .objects
+            .iter()
+            .map(|p| {
+                let path = p.as_path();
+                let data = read(path).map_path_err(path)?;
+                Ok(Input { data, path })
+            })
+            .collect::<Result<Vec<Input>, Error<'_>>>()?;
+        let elfs = objects
+            .iter()
+            .map(|o| o.process(&mut writer))
+            .collect::<Result<Vec<Option<Object<'_>>>, Error<'_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<Object<'_>>>();
+        self.process_archives_containing(&mut writer)?;
+        writer.compute_sections().map_path_err(self.options.output.as_path())?;
+        for object in &elfs {
+            let elf = &object.elf;
+            for (section_index, rels) in &elf.shdr_relocs {
+                for rel in rels.iter() {
+                    let symbol = &elf.syms.get(rel.r_sym as usize).unwrap();
+                    let index =
+                        if let Some(sec) = object.section_relocations.get(&(section_index - 1)) {
+                            *sec
+                        } else {
+                            continue;
+                        };
+                    let symbol = if let Some(sym) = object.symbols.get(&Symbol(*symbol)) {
+                        sym
+                    } else {
+                        log::trace!(
+                            "discarded relocation due to missing symbol {:?} type: {}",
+                            rel,
+                            r_to_str(rel.r_type, EM_X86_64)
+                        );
+                        continue;
+                    };
+                    log::trace!(
+                        "applying relocation {:?} type: {}",
+                        rel,
+                        r_to_str(rel.r_type, EM_X86_64)
+                    );
+                    apply_relocation(elf, &mut writer, *symbol, rel, index);
+                }
+            }
+        }
+        writer.write_to_disk();
+        Ok(())
+    }
 }
 
 fn get_section_name<'e>(elf: &Elf<'e>, index: usize) -> Result<&'e str, String> {

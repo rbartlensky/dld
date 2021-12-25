@@ -36,6 +36,7 @@ OPTIONS:
 struct AppArgs {
     opts: Options,
     objects: HashSet<PathBuf>,
+    archives: HashSet<PathBuf>,
     search_paths: HashSet<PathBuf>,
     scripts: Vec<PathBuf>,
     inputs: HashMap<PathBuf, bool>,
@@ -58,10 +59,15 @@ fn main() -> Result<(), String> {
         }
     }
     log::debug!("{:#?}", args);
-    if let Err(e) = dld::link(&args.objects.into_iter().collect::<Vec<_>>(), &args.opts) {
+    let linker = dld::Linker {
+        options: args.opts,
+        objects: args.objects,
+        archives: args.archives,
+    };
+    if let Err(e) = linker.link() {
         Err(format!("{}", e))
     } else {
-        println!("Elf executable in: {}", args.opts.output.display());
+        println!("Elf executable in: {}", linker.options.output.display());
         Ok(())
     }
 }
@@ -168,6 +174,9 @@ fn handle_linker_args(
                 app.as_needed = false;
                 continue;
             }
+            "--start-group" | "--end-group" => {
+                continue;
+            }
             _ => {
                 // a "special" arg incoming...
             }
@@ -210,8 +219,11 @@ fn search_for_inputs(args: &mut AppArgs) -> Result<(), PathBuf> {
         if let Some(lib) = found.take() {
             let file_type = file_type(&lib).unwrap();
             match file_type {
-                FileType::Archive | FileType::ElfObject => {
+                FileType::ElfObject => {
                     args.objects.insert(lib.canonicalize().unwrap());
+                }
+                FileType::Archive => {
+                    args.archives.insert(lib.canonicalize().unwrap());
                 }
                 FileType::ElfSharedLib => args.opts.shared_libs.push((lib, as_needed)),
                 FileType::Text => args.scripts.push(lib),
