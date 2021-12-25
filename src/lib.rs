@@ -144,15 +144,41 @@ pub struct Linker {
 }
 
 impl Linker {
+    fn find_undefined_symbols_in_libs<'o>(
+        &'o self,
+        symbols: Vec<elf::SymbolRef>,
+        writer: &mut elf::Writer<'o>,
+    ) -> Result<Vec<elf::SymbolRef>, Error<'o>> {
+        let mut undefines =
+            symbols.into_iter().map(|s| (s, false)).collect::<HashMap<elf::SymbolRef, bool>>();
+        for (lib, _) in &self.options.shared_libs {
+            let path = lib.as_path();
+            let data = read(path).map_path_err(path)?;
+            let elf = Elf::parse(&data).unwrap();
+            for entry in undefines.iter_mut().filter(|(_, v)| !**v) {
+                let name = writer.symbol_name(*entry.0).to_string();
+                for sym in &elf.dynsyms {
+                    let inner_name = get_dyn_symbol_name(&elf, sym.st_name).map_path_err(path)?;
+                    if name == inner_name {
+                        *entry.1 = true;
+                        writer
+                            .add_dyn_symbol(sym.into(), None, inner_name, path)
+                            .map_path_err(path)?;
+                    }
+                }
+            }
+            undefines.retain(|_, found| !*found);
+        }
+        Ok(undefines.into_iter().map(|(k, _)| k).collect())
+    }
+
     fn process_archives_containing<'o>(
         &'o self,
+        symbols: Vec<elf::SymbolRef>,
         writer: &mut elf::Writer<'o>,
     ) -> Result<(), Error<'o>> {
-        let mut undefines = writer
-            .undefined_symbols()
-            .into_iter()
-            .map(|s| (s, false))
-            .collect::<HashMap<elf::SymbolRef, bool>>();
+        let mut undefines =
+            symbols.into_iter().map(|s| (s, false)).collect::<HashMap<elf::SymbolRef, bool>>();
         for ar in &self.archives {
             let path = ar.as_path();
             let data = read(path).map_path_err(path)?;
@@ -196,7 +222,9 @@ impl Linker {
             .into_iter()
             .flatten()
             .collect::<Vec<Object<'_>>>();
-        self.process_archives_containing(&mut writer)?;
+        let undefined = writer.undefined_symbols();
+        let undefined = self.find_undefined_symbols_in_libs(undefined, &mut writer)?;
+        self.process_archives_containing(undefined, &mut writer)?;
         writer.compute_sections().map_path_err(self.options.output.as_path())?;
         for object in &elfs {
             let elf = &object.elf;
@@ -239,6 +267,10 @@ fn get_section_name<'e>(elf: &Elf<'e>, index: usize) -> Result<&'e str, String> 
 
 fn get_symbol_name<'e>(elf: &Elf<'e>, index: usize) -> Result<&'e str, String> {
     elf.strtab.get_at(index).ok_or_else(|| "Symbol not found in strtab.".to_string())
+}
+
+fn get_dyn_symbol_name<'e>(elf: &Elf<'e>, index: usize) -> Result<&'e str, String> {
+    elf.dynstrtab.get_at(index).ok_or_else(|| "Symbol not found in strtab.".to_string())
 }
 
 #[allow(clippy::many_single_char_names)]

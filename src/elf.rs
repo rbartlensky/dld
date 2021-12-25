@@ -77,6 +77,8 @@ pub struct Writer<'d> {
     section_names: StringTable,
     symbol_names: StringTable,
     symbols: HashMap<u32, Symbol<'d>>,
+    dyn_symbol_names: StringTable,
+    dyn_symbols: HashMap<u32, Symbol<'d>>,
     sections: Vec<Section>,
     got_len: usize,
     plt: HashMap<SymbolRef, usize>,
@@ -116,6 +118,8 @@ impl<'d> Writer<'d> {
             section_names: Default::default(),
             symbol_names: Default::default(),
             symbols: Default::default(),
+            dyn_symbol_names: Default::default(),
+            dyn_symbols: Default::default(),
             sections: Default::default(),
             // first entry reserved
             got_len: 1,
@@ -219,15 +223,16 @@ impl<'d> Writer<'d> {
         };
     }
 
-    pub fn add_symbol<'s>(
-        &mut self,
+    fn add_symbol_inner<'s>(
         mut elf_sym: Sym,
         sec_ref: Option<SectionRef>,
         name: &'s str,
         reference: &'d Path,
+        symbol_names: &mut StringTable,
+        symbols: &mut HashMap<u32, Symbol<'d>>,
     ) -> Result<Option<SymbolRef>, ErrorType> {
         let name = name.to_string();
-        let st_name = self.symbol_names.get_or_create(name.clone()).offset as u32;
+        let st_name = symbol_names.get_or_create(name.clone()).offset as u32;
         elf_sym.st_name = st_name;
         log::trace!("name: '{}' -> sym: {:?}", name, elf_sym);
         if let Some(sec_ref) = sec_ref {
@@ -237,7 +242,7 @@ impl<'d> Writer<'d> {
             return Ok(None);
         }
         let new_sym = Symbol::new(elf_sym, reference);
-        match self.symbols.entry(st_name) {
+        match symbols.entry(st_name) {
             Entry::Occupied(mut s) => {
                 let old_sym = &mut s.get_mut();
                 // we found another definition of this global symbol
@@ -272,6 +277,40 @@ impl<'d> Writer<'d> {
             }
         }
         Ok(Some(SymbolRef { st_name }))
+    }
+
+    pub fn add_symbol<'s>(
+        &mut self,
+        elf_sym: Sym,
+        sec_ref: Option<SectionRef>,
+        name: &'s str,
+        reference: &'d Path,
+    ) -> Result<Option<SymbolRef>, ErrorType> {
+        Self::add_symbol_inner(
+            elf_sym,
+            sec_ref,
+            name,
+            reference,
+            &mut self.symbol_names,
+            &mut self.symbols,
+        )
+    }
+
+    pub fn add_dyn_symbol<'s>(
+        &mut self,
+        elf_sym: Sym,
+        sec_ref: Option<SectionRef>,
+        name: &'s str,
+        reference: &'d Path,
+    ) -> Result<Option<SymbolRef>, ErrorType> {
+        Self::add_symbol_inner(
+            elf_sym,
+            sec_ref,
+            name,
+            reference,
+            &mut self.dyn_symbol_names,
+            &mut self.dyn_symbols,
+        )
     }
 
     pub fn symbol(&self, sym: SymbolRef) -> Symbol<'_> {
@@ -420,6 +459,8 @@ impl<'d> Writer<'d> {
     // program header 1
     // ...
     pub fn compute_sections(&mut self) -> Result<(), ErrorType> {
+        let dyn_symtab_name = self.section_names.get_or_create(".dynsym").offset;
+        let dyn_strtab_name = self.section_names.get_or_create(".dynstr").offset;
         let symtab_name = self.section_names.get_or_create(".symtab").offset;
         let strtab_name = self.section_names.get_or_create(".strtab").offset;
         let shstrtab_name = self.section_names.get_or_create(".shstrtab").offset;
@@ -477,8 +518,10 @@ impl<'d> Writer<'d> {
         for sym in syms {
             let st_bind = sym.st_info >> 4;
             if sym.st_shndx as u32 == SHN_UNDEF && st_bind == STB_GLOBAL {
-                undefined_symbols
-                    .push(self.symbol_names.name(sym.st_name as usize).unwrap().to_string());
+                let name = self.symbol_names.name(sym.st_name as usize).unwrap().to_string();
+                if self.dyn_symbol_names.get(name.clone()).is_none() {
+                    undefined_symbols.push(name);
+                }
                 continue;
             }
             // since we now have an address for our sections, we can patch the

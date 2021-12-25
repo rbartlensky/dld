@@ -59,11 +59,7 @@ fn main() -> Result<(), String> {
         }
     }
     log::debug!("{:#?}", args);
-    let linker = dld::Linker {
-        options: args.opts,
-        objects: args.objects,
-        archives: args.archives,
-    };
+    let linker = dld::Linker { options: args.opts, objects: args.objects, archives: args.archives };
     if let Err(e) = linker.link() {
         Err(format!("{}", e))
     } else {
