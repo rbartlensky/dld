@@ -195,7 +195,7 @@ impl Linker {
                 let object = ar.get(member).unwrap();
                 let object_data =
                     &data[(object.offset as usize)..(object.offset as usize + object.size())];
-                let elf = Elf::parse(&object_data).unwrap();
+                let elf = Elf::parse(object_data).unwrap();
                 process_elf_object(path, object_data, elf, writer)?;
             }
             undefines.retain(|_, found| !*found);

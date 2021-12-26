@@ -5,26 +5,21 @@ use goblin::elf64::{
     program_header::{ProgramHeader, PF_R, PF_W, PF_X, PT_LOAD},
     reloc::{Rela, R_X86_64_TLSGD},
     section_header::{
-        SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_UNDEF,
-        SHT_NULL, SHT_PROGBITS, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
+        SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_UNDEF, SHT_NULL, SHT_PROGBITS,
+        SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
     },
     sym::{Sym, STB_GLOBAL, STB_LOCAL},
 };
-use std::{
-    cmp::Ordering,
-    collections::{hash_map::Entry, HashMap},
-    convert::TryInto,
-    fs::File,
-    io::Write,
-    mem::size_of,
-    path::Path,
-};
+use std::{collections::HashMap, convert::TryInto, fs::File, io::Write, mem::size_of, path::Path};
 
 mod options;
 pub use options::*;
 
 mod string_table;
 pub use string_table::StringTable;
+
+mod symbol_table;
+pub use symbol_table::{SymbolRef, SymbolTable};
 
 const PAGE_SIZE: u64 = 0x1000;
 
@@ -35,12 +30,6 @@ pub struct SectionRef {
     /// The byte offset at which a particular section was relocated to, relative
     /// to the start of the section of `index`.
     pub insertion_point: usize,
-}
-
-/// A symbol can be fetched by indexing `symbols` in the following way: `symbols[st_name][index]`.
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub struct SymbolRef {
-    pub st_name: u32,
 }
 
 pub struct Section {
@@ -76,9 +65,9 @@ pub struct Writer<'d> {
     eh: Header,
     section_names: StringTable,
     symbol_names: StringTable,
-    symbols: HashMap<u32, Symbol<'d>>,
+    symbols: SymbolTable<'d>,
     dyn_symbol_names: StringTable,
-    dyn_symbols: HashMap<u32, Symbol<'d>>,
+    dyn_symbols: SymbolTable<'d>,
     sections: Vec<Section>,
     got_len: usize,
     plt: HashMap<SymbolRef, usize>,
@@ -224,7 +213,7 @@ impl<'d> Writer<'d> {
         name: &'s str,
         reference: &'d Path,
         symbol_names: &mut StringTable,
-        symbols: &mut HashMap<u32, Symbol<'d>>,
+        symbols: &mut SymbolTable<'d>,
     ) -> Result<Option<SymbolRef>, ErrorType> {
         let name = name.to_string();
         let st_name = symbol_names.get_or_create(name.clone()).offset as u32;
@@ -234,42 +223,9 @@ impl<'d> Writer<'d> {
             elf_sym.st_shndx = sec_ref.index as u16;
             elf_sym.st_value += sec_ref.insertion_point as u64;
         }
-        let new_sym = Symbol::new(elf_sym, reference);
-        match symbols.entry(st_name) {
-            Entry::Occupied(mut s) => {
-                let old_sym = &mut s.get_mut();
-                // we found another definition of this global symbol
-                if old_sym.is_global()
-                    && new_sym.is_global()
-                    && old_sym.st_shndx != SHN_UNDEF as u16
-                    && new_sym.st_shndx != SHN_UNDEF as u16
-                {
-                    log::trace!(
-                        "Old defition: {:#?} vs new definition: {:#?}",
-                        old_sym.sym,
-                        new_sym.sym
-                    );
-                    return Err(ErrorType::Other(format!(
-                        "Symbol {} already defined in {}",
-                        name,
-                        old_sym.reference().display()
-                    )));
-                }
-                if !old_sym.higher_bind_than(new_sym) {
-                    old_sym.st_info = new_sym.st_info;
-                    old_sym.st_other = new_sym.st_other;
-                    old_sym.st_shndx = new_sym.st_shndx;
-                    old_sym.st_value = new_sym.st_value;
-                    old_sym.st_size = new_sym.st_size;
-                } else if old_sym.st_shndx == SHN_UNDEF as u16 {
-                    old_sym.st_shndx = new_sym.st_shndx;
-                }
-            }
-            Entry::Vacant(v) => {
-                v.insert(new_sym);
-            }
-        }
-        Ok(Some(SymbolRef { st_name }))
+        symbols
+            .add_symbol(elf_sym, reference)
+            .map_err(|e| ErrorType::Other(format!("{} {}", name, e)))
     }
 
     pub fn add_symbol<'s>(
@@ -310,16 +266,16 @@ impl<'d> Writer<'d> {
     }
 
     pub fn symbol(&self, sym: SymbolRef) -> Symbol<'_> {
-        self.symbols[&sym.st_name]
+        *self.symbols.get(sym).unwrap()
     }
 
     pub fn symbol_name(&self, sym: SymbolRef) -> &str {
-        &self.symbol_names.name(sym.st_name as usize).unwrap()
+        self.symbol_names.name(sym.st_name as usize).unwrap()
     }
 
     pub fn undefined_symbols(&self) -> Vec<SymbolRef> {
         let mut undefined = vec![];
-        for (st_name, sym) in &self.symbols {
+        for (st_name, sym) in self.symbols.iter() {
             if sym.st_shndx as u32 == SHN_UNDEF && sym.st_bind() == STB_GLOBAL {
                 undefined.push(SymbolRef { st_name: *st_name });
             }
@@ -333,7 +289,7 @@ impl<'d> Writer<'d> {
     }
 
     pub fn add_got_entry(&mut self, sym: SymbolRef, r_type: u32) {
-        let sym = &mut self.symbols.get_mut(&sym.st_name).unwrap();
+        let sym = self.symbols.get_mut(sym).unwrap();
         if sym.got_offset().is_none() {
             sym.set_got_offset(self.got_len * size_of::<u64>());
             // For TLSGD relocations we need to allocate two slots
@@ -347,7 +303,7 @@ impl<'d> Writer<'d> {
         let len = self.got_plt.len() + 3;
         let offset = *self.got_plt.entry(sym).or_insert(len * size_of::<u64>());
 
-        let sym = &mut self.symbols.get_mut(&sym.st_name).unwrap();
+        let sym = self.symbols.get_mut(sym).unwrap();
         sym.set_got_plt_offset(offset);
         sym.set_plt_index(index);
     }
@@ -365,11 +321,11 @@ impl<'d> Writer<'d> {
         self.sections[1].data.extend(std::iter::repeat(0).take(size_of::<u64>() * (self.got_len)));
         if let Some(e) = self.symbol_names.get("_GLOBAL_OFFSET_TABLE_") {
             let got_addr = self.got_address();
-            self.symbols.entry(e.offset as u32).and_modify(|s| {
+            if let Some(s) = self.symbols.get_mut(SymbolRef { st_name: e.offset as u32 }) {
                 // 1 == .got section
                 s.st_shndx = 1;
                 s.st_value = got_addr
-            });
+            };
         }
     }
 
@@ -385,7 +341,7 @@ impl<'d> Writer<'d> {
         let plt_address = self.plt_address();
         // [2] == .got.plt
         for (sym, addr) in &self.got_plt {
-            let sym = &self.symbols[&sym.st_name];
+            let sym = self.symbols.get(*sym).unwrap();
             // 16 to skip the header, another 16 for all entries before plt_index, and then another 11
             let plt_index = sym.plt_index().unwrap();
             self.sections[2].data[*addr..]
@@ -418,7 +374,7 @@ impl<'d> Writer<'d> {
         }
         for (symbol_ref, plt_index) in &self.plt {
             let entry = &mut self.sections[3].data[16 * (plt_index + 1)..];
-            let sym = &self.symbols[&symbol_ref.st_name];
+            let sym = self.symbols.get(*symbol_ref).unwrap();
             let got_plt_offset = sym.got_plt_offset().unwrap().try_into().unwrap();
             let plt_index: u32 = (*plt_index).try_into().unwrap();
             entry[2..].as_mut().write_u32::<LittleEndian>(got_plt_offset).unwrap();
@@ -439,7 +395,7 @@ impl<'d> Writer<'d> {
                 let size = section.sh.sh_size;
                 let addr = section.sh.sh_addr;
                 for (s, v) in [(start, addr), (end, addr + size)] {
-                    let sym = self.symbols.get_mut(&(s.offset as u32)).unwrap();
+                    let sym = self.symbols.get_mut(SymbolRef { st_name: s.offset as u32 }).unwrap();
                     sym.st_shndx = section_entry.index as u16;
                     sym.st_value = v
                 }
@@ -456,8 +412,7 @@ impl<'d> Writer<'d> {
 
         let mut section = vec![];
         let mut section_len = 0;
-        let mut syms: Vec<&mut Sym> = self.dyn_symbols.values_mut().map(|s| &mut s.sym).collect();
-        syms.sort_by(|s1, s2| sort_symbols_func(s1, s2));
+        let syms = self.dyn_symbols.sorted();
         let mut last_local = 0;
         for sym in syms {
             let st_bind = sym.st_info >> 4;
@@ -486,8 +441,7 @@ impl<'d> Writer<'d> {
         // serialize symbols and make sure that locals come first
         let mut section = vec![];
         let mut section_len = 0;
-        let mut syms: Vec<&mut Sym> = self.symbols.values_mut().map(|s| &mut s.sym).collect();
-        syms.sort_by(|s1, s2| sort_symbols_func(s1, s2));
+        let syms = self.symbols.sorted();
         let mut undefined_symbols = vec![];
         let mut last_local = 0;
         for sym in syms {
@@ -611,26 +565,6 @@ impl<'d> Writer<'d> {
                 ph.serialize(&mut self.out);
             }
         }
-    }
-}
-
-fn st_type(st_info: u8) -> u8 {
-    st_info & 0xf
-}
-
-fn st_bind(st_info: u8) -> u8 {
-    st_info >> 4
-}
-
-// local before global, notype before other types
-fn sort_symbols_func(s1: &Sym, s2: &Sym) -> Ordering {
-    let b1 = st_bind(s1.st_info);
-    let b2 = st_bind(s2.st_info);
-    let t1 = st_type(s1.st_info);
-    let t2 = st_type(s2.st_info);
-    match b1.cmp(&b2) {
-        Ordering::Equal => t1.cmp(&t2),
-        c => c,
     }
 }
 

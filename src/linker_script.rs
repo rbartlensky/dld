@@ -76,7 +76,7 @@ pub fn parse(mut input: &str) -> Result<Vec<String>, StringStreamError> {
         if let Some(args) = args {
             new_args.extend(args);
         }
-        if leftover != "" {
+        if !leftover.is_empty() {
             input = leftover;
         } else {
             break;

@@ -77,13 +77,13 @@ impl<'r> Symbol<'r> {
     pub fn higher_bind_than(&self, sym: Symbol<'_>) -> bool {
         let s1 = self.st_bind();
         let s2 = sym.st_bind();
-        match (s1, s2) {
+        !matches!(
+            (s1, s2),
             (STB_LOCAL, STB_LOCAL)
-            | (STB_LOCAL, STB_WEAK)
-            | (STB_LOCAL, STB_GLOBAL)
-            | (STB_WEAK, STB_GLOBAL) => false,
-            _ => true,
-        }
+                | (STB_LOCAL, STB_WEAK)
+                | (STB_LOCAL, STB_GLOBAL)
+                | (STB_WEAK, STB_GLOBAL)
+        )
     }
 }
 
