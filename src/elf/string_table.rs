@@ -1,3 +1,5 @@
+use goblin::elf64::section_header::{SectionHeader, SHT_STRTAB};
+
 use crate::name::Name;
 
 use std::collections::HashMap;
@@ -9,7 +11,7 @@ pub struct Entry {
     pub new: bool,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct StringTable {
     // name -> (index, offset)
     names: HashMap<Name, (usize, usize)>,
@@ -55,5 +57,26 @@ impl StringTable {
             .collect::<Vec<(_, (usize, usize))>>();
         names.sort_by(|a, b| a.1 .1.cmp(&b.1 .1));
         names
+    }
+
+    pub fn section_header(&self, sh_name: u32) -> crate::elf::Section {
+        use crate::serialize::Serialize;
+
+        let mut section = vec![];
+        let names = self.sorted_names();
+        for (name, _) in names {
+            name.serialize(&mut section);
+        }
+        // add our string table section header
+        crate::elf::Section {
+            sh: SectionHeader {
+                sh_name,
+                sh_type: SHT_STRTAB,
+                sh_size: self.total_len() as u64,
+                ..Default::default()
+            },
+            ph: None,
+            data: section,
+        }
     }
 }
