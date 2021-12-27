@@ -164,6 +164,7 @@ impl Linker {
                         writer
                             .add_dyn_symbol(sym.into(), None, inner_name, path)
                             .map_path_err(path)?;
+                        writer.add_needed(path.file_name().unwrap().to_str().unwrap());
                     }
                 }
             }

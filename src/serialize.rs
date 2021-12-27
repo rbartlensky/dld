@@ -100,3 +100,11 @@ impl<W: Write, S: Serialize<W>> Serialize<W> for Vec<S> {
         written
     }
 }
+
+impl<W: Write> Serialize<W> for (crate::elf::DynTag, u64) {
+    fn serialize(&self, buf: &mut W) -> usize {
+        buf.write_u64::<LittleEndian>(self.0 as u64).unwrap();
+        buf.write_u64::<LittleEndian>(self.1).unwrap();
+        size_of::<u64>() * 2
+    }
+}
