@@ -5,8 +5,8 @@ use goblin::elf64::{
     program_header::{ProgramHeader, PF_R, PF_W, PF_X, PT_LOAD},
     reloc::{Rela, R_X86_64_TLSGD},
     section_header::{
-        SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_UNDEF, SHT_NULL, SHT_PROGBITS,
-        SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
+        SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_UNDEF, SHT_DYNSYM, SHT_NULL,
+        SHT_PROGBITS, SHT_RELA, SHT_SYMTAB,
     },
     sym::{Sym, STB_GLOBAL, STB_LOCAL},
 };
@@ -403,12 +403,14 @@ impl<'d> Writer<'d> {
         }
     }
 
-    fn compute_tables(&mut self) -> Result<(), ErrorType> {
+    fn compute_tables(&mut self) -> Result<usize, ErrorType> {
         let dyn_symtab_name = self.section_names.get_or_create(".dynsym").offset;
         let dyn_strtab_name = self.section_names.get_or_create(".dynstr").offset;
         let symtab_name = self.section_names.get_or_create(".symtab").offset;
         let strtab_name = self.section_names.get_or_create(".strtab").offset;
         let shstrtab_name = self.section_names.get_or_create(".shstrtab").offset;
+
+        let last_section = self.sections.len();
 
         let mut section = vec![];
         let mut section_len = 0;
@@ -425,7 +427,7 @@ impl<'d> Writer<'d> {
         self.sections.push(Section {
             sh: SectionHeader {
                 sh_name: dyn_symtab_name as u32,
-                sh_type: SHT_SYMTAB,
+                sh_type: SHT_DYNSYM,
                 sh_size: section_len as u64,
                 sh_info: last_local,
                 sh_entsize: size_of::<Sym>() as u64,
@@ -486,7 +488,7 @@ impl<'d> Writer<'d> {
         self.sections.push(self.symbol_names.section_header(strtab_name as u32));
         self.sections.push(self.section_names.section_header(shstrtab_name as u32));
 
-        Ok(())
+        Ok(last_section)
     }
 
     // elf header
@@ -503,15 +505,10 @@ impl<'d> Writer<'d> {
 
         self.handle_special_symbols();
 
-        self.compute_tables()?;
-
-        self.eh.e_shnum = self.sections.len() as u16;
-        // last section is the section header string table
-        self.eh.e_shstrndx = self.eh.e_shnum - 1;
-
         let mut p_vaddr = self.eh.e_entry;
         // patch section and program headers
         let mut file_offset = size_of::<Header>() as u64;
+        let sections_len = self.sections.len();
         for section in &mut self.sections {
             section.sh.sh_offset = file_offset;
             if let Some(ph) = &mut section.ph {
@@ -527,17 +524,29 @@ impl<'d> Writer<'d> {
                 self.eh.e_phnum += 1;
             }
             if !section.data.is_empty() {
-                if section.sh.sh_type != SHT_SYMTAB && section.sh.sh_type != SHT_STRTAB {
-                    section.align_and_extend_data();
-                }
+                section.align_and_extend_data();
                 file_offset += section.data.len() as u64;
             }
             if self.section_names.name(section.sh.sh_name as usize).unwrap().starts_with(".rel") {
                 // the symbol table is the last section
-                section.sh.sh_link = self.eh.e_shnum as u32 - 1;
+                // TODO: + 5 because we will be adding 5 more sections after this...
+                section.sh.sh_link = sections_len as u32 - 1 + 5;
             }
         }
 
+        // we need to first patch all section headers before we
+        // serialize our symbols. This is because we need to set symbol values
+        // based on the section they refer to.
+        let last_section = self.compute_tables()?;
+        // patch symtab and string tab sections
+        for section in &mut self.sections[last_section..] {
+            section.sh.sh_offset = file_offset;
+            file_offset += section.data.len() as u64;
+        }
+
+        self.eh.e_shnum = self.sections.len() as u16;
+        // last section is the section header string table
+        self.eh.e_shstrndx = self.eh.e_shnum - 1;
         self.eh.e_shoff = file_offset;
         // the program header comes right after all the sections + headers
         self.eh.e_phoff =
@@ -549,15 +558,20 @@ impl<'d> Writer<'d> {
 
     pub fn write_to_disk(mut self) {
         let mut offset = 0;
-        log::trace!("{:x}: ---- elf header ----\n{:#?}", offset, self.eh);
+        log::trace!("0x{:x}: ---- elf header ----\n{:#?}", offset, self.eh);
         offset += self.eh.serialize(&mut self.out);
         for (i, section) in self.sections.iter().enumerate() {
-            log::trace!("{:x}: ---- section {} ----", offset, i);
+            log::trace!(
+                "0x{:x}: ---- section {} {:?} ----",
+                offset,
+                i,
+                self.section_names.name(section.sh.sh_name as usize)
+            );
             self.out.write_all(&section.data).unwrap();
             offset += section.data.len();
         }
         for (i, section) in self.sections.iter().enumerate() {
-            log::trace!("{:x}: ---- section {} ----\n{:?}", offset, i, section.sh);
+            log::trace!("0x{:x}: ---- section {} ----\n{:#?}", offset, i, section.sh);
             offset += section.sh.serialize(&mut self.out);
         }
         for section in self.sections {
