@@ -6,7 +6,7 @@ use goblin::elf64::{
     reloc::{Rela, R_X86_64_TLSGD},
     section_header::{
         SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_UNDEF, SHT_DYNAMIC, SHT_DYNSYM,
-        SHT_NULL, SHT_PROGBITS, SHT_RELA, SHT_SYMTAB,
+        SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_RELA, SHT_SYMTAB,
     },
     sym::{Sym, STB_GLOBAL, STB_LOCAL},
 };
@@ -21,8 +21,6 @@ pub use string_table::StringTable;
 mod symbol_table;
 pub use symbol_table::{SymbolRef, SymbolTable};
 
-const PAGE_SIZE: u64 = 0x1000;
-
 #[derive(Debug, Clone, Copy)]
 pub struct SectionRef {
     /// The section index where a particular section was relocated to.
@@ -35,28 +33,13 @@ pub struct SectionRef {
 pub struct Section {
     /// The section header of the section.
     sh: SectionHeader,
-    /// In case we load this section into memory, we will also have an
-    /// associated program header.
-    ph: Option<ProgramHeader>,
     /// The data of the section.
     data: Vec<u8>,
 }
 
-impl Section {
-    /// Returns the size of the data, rounded to the next multiple of `PAGE_SIZE`.
-    pub fn data_size(&self) -> u64 {
-        round_to(self.data.len() as u64, PAGE_SIZE)
-    }
-
-    /// Extends the data, such that the length becomes a multiple of `PAGE_SIZE`.
-    pub fn align_and_extend_data(&mut self) {
-        self.data.extend(std::iter::repeat(0).take(self.data_size() as usize - self.data.len()));
-    }
-}
-
 impl From<SectionHeader> for Section {
     fn from(sh: SectionHeader) -> Self {
-        Self { sh, ph: None, data: vec![] }
+        Self { sh, data: vec![] }
     }
 }
 
@@ -137,6 +120,7 @@ pub struct Writer<'d> {
     plt: HashMap<SymbolRef, usize>,
     got_plt: HashMap<SymbolRef, usize>,
     dyn_entries: Vec<(DynTag, u64)>,
+    program_headers: Vec<ProgramHeader>,
 }
 
 impl<'d> Writer<'d> {
@@ -179,6 +163,7 @@ impl<'d> Writer<'d> {
             plt: Default::default(),
             got_plt: Default::default(),
             dyn_entries: vec![(DynTag::Null, 0)],
+            program_headers: vec![],
         };
 
         let null_section = goblin::elf::SectionHeader { sh_type: SHT_NULL, ..Default::default() };
@@ -192,6 +177,23 @@ impl<'d> Writer<'d> {
         // .plt's personal .got
         s.add_section(".got.plt", &got_section, None);
         s.add_section(".plt", &got_section, None);
+
+        let loader = options
+            .dynamic_linker
+            .to_str()
+            .unwrap()
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u8>>();
+        let interp_section = goblin::elf::SectionHeader {
+            sh_type: SHT_PROGBITS,
+            sh_flags: SHF_ALLOC as u64,
+            sh_size: loader.len() as u64,
+            ..Default::default()
+        };
+        s.add_section(".interp", &interp_section, Some(loader));
 
         let null_sym = Sym { st_shndx: SHN_UNDEF as u16, ..Default::default() };
         s.add_symbol(null_sym, None, "", Path::new("")).unwrap();
@@ -222,8 +224,7 @@ impl<'d> Writer<'d> {
                 sh_addr: 0,
                 sh_offset: 0,
             };
-            let ph = get_program_header(&sh);
-            self.sections.push(Section { sh, ph, data: data.unwrap_or_default() });
+            self.sections.push(Section { sh, data: data.unwrap_or_default() });
             0
         } else {
             let section = &mut self.sections[entry.index];
@@ -266,7 +267,7 @@ impl<'d> Writer<'d> {
             };
             let mut v = vec![0; size_of::<Rela>()];
             r.serialize(&mut v);
-            self.sections.push(Section { sh, ph: None, data: v });
+            self.sections.push(Section { sh, data: v });
         } else {
             let section = &mut self.sections[entry.index];
             section.sh.sh_size += size_of::<Rela>() as u64;
@@ -488,11 +489,6 @@ impl<'d> Writer<'d> {
         let shstrtab_name = self.section_names.get_or_create(".shstrtab").offset;
 
         let p_vaddr = &mut p_vaddr;
-        let post_inc = |v: &mut u64, inc: u64| {
-            let tmp = *v;
-            *v += inc;
-            tmp
-        };
 
         // prepare .dynsym section and segment
         let mut section = vec![];
@@ -508,7 +504,7 @@ impl<'d> Writer<'d> {
         let alignment = std::mem::align_of::<u64>() as u64;
         *p_vaddr = round_to(*p_vaddr, alignment);
         let len = section.len() as u64;
-        let sh = SectionHeader {
+        let mut sh = SectionHeader {
             sh_name: dyn_symtab_name as u32,
             sh_type: SHT_DYNSYM,
             sh_size: len,
@@ -518,43 +514,19 @@ impl<'d> Writer<'d> {
             sh_flags: SHF_ALLOC as u64,
             sh_offset: post_inc(file_offset, len),
             sh_addralign: alignment,
-            sh_addr: post_inc(p_vaddr, len),
+            sh_addr: 0,
         };
-        self.sections.push(Section {
-            sh,
-            ph: Some(ProgramHeader {
-                p_type: PT_LOAD,
-                p_flags: PF_R,
-                p_align: alignment,
-                p_offset: sh.sh_offset,
-                p_vaddr: *p_vaddr,
-                p_paddr: post_inc(p_vaddr, sh.sh_size),
-                p_filesz: sh.sh_size,
-                p_memsz: sh.sh_size,
-            }),
-            data: section,
-        });
-        self.eh.e_phnum += 1;
+        self.sections.push(Section { sh, data: section });
+        self.program_headers.push(get_program_header(&mut sh, p_vaddr).unwrap());
 
         // prepare .dynstr section and segment
         let mut sec = self.dyn_symbol_names.section_header(dyn_strtab_name as u32);
         sec.sh.sh_flags |= SHF_ALLOC as u64;
         sec.sh.sh_offset = post_inc(file_offset, sec.sh.sh_size);
         sec.sh.sh_addralign = 1;
-        sec.sh.sh_addr = *p_vaddr;
         let dyn_strtab_vaddr = *p_vaddr;
-        sec.ph = Some(ProgramHeader {
-            p_type: PT_LOAD,
-            p_flags: PF_R,
-            p_align: sec.sh.sh_addralign,
-            p_offset: sec.sh.sh_offset,
-            p_vaddr: *p_vaddr,
-            p_paddr: post_inc(p_vaddr, sh.sh_size),
-            p_filesz: sec.sh.sh_size,
-            p_memsz: sec.sh.sh_size,
-        });
+        self.program_headers.push(get_program_header(&mut sec.sh, p_vaddr).unwrap());
         self.sections.push(sec);
-        self.eh.e_phnum += 1;
 
         // prepare .dynamic section and segment
         self.dyn_entries.push((DynTag::Strtab, dyn_strtab_vaddr));
@@ -565,7 +537,7 @@ impl<'d> Writer<'d> {
         let len = section.len() as u64;
         let alignment = std::mem::align_of::<u64>() as u64;
         *p_vaddr = round_to(*p_vaddr, alignment);
-        let sh = SectionHeader {
+        let mut sh = SectionHeader {
             sh_name: dynamic_name as u32,
             sh_type: SHT_DYNAMIC,
             sh_size: len,
@@ -573,24 +545,10 @@ impl<'d> Writer<'d> {
             sh_flags: SHF_ALLOC as u64,
             sh_offset: post_inc(file_offset, len),
             sh_addralign: alignment,
-            sh_addr: *p_vaddr,
             ..Default::default()
         };
-        self.sections.push(Section {
-            sh,
-            ph: Some(ProgramHeader {
-                p_type: PT_DYNAMIC,
-                p_flags: PF_R,
-                p_align: alignment,
-                p_offset: sh.sh_offset,
-                p_vaddr: *p_vaddr,
-                p_paddr: post_inc(p_vaddr, len),
-                p_filesz: len,
-                p_memsz: len,
-            }),
-            data: section,
-        });
-        self.eh.e_phnum += 1;
+        self.sections.push(Section { sh, data: section });
+        self.program_headers.push(get_program_header(&mut sh, p_vaddr).unwrap());
 
         // serialize symbols and make sure that locals come first
         let mut section = vec![];
@@ -633,7 +591,6 @@ impl<'d> Writer<'d> {
                 sh_offset: post_inc(file_offset, section.len() as u64),
                 ..Default::default()
             },
-            ph: None,
             data: section,
         });
 
@@ -667,17 +624,8 @@ impl<'d> Writer<'d> {
         let sections_len = self.sections.len();
         for section in &mut self.sections {
             section.sh.sh_offset = file_offset;
-            if let Some(ph) = &mut section.ph {
-                p_vaddr = round_to(p_vaddr, section.sh.sh_addralign);
-                section.sh.sh_addr = p_vaddr;
-                ph.p_align = section.sh.sh_addralign;
-                ph.p_offset = file_offset;
-                ph.p_vaddr = p_vaddr;
-                ph.p_paddr = p_vaddr;
-                ph.p_filesz = section.sh.sh_size;
-                ph.p_memsz = section.sh.sh_size;
-                p_vaddr += section.sh.sh_size;
-                self.eh.e_phnum += 1;
+            if let Some(ph) = get_program_header(&mut section.sh, &mut p_vaddr) {
+                self.program_headers.push(ph);
             }
             file_offset += section.data.len() as u64;
             if self.section_names.name(section.sh.sh_name as usize).unwrap().starts_with(".rel") {
@@ -693,6 +641,7 @@ impl<'d> Writer<'d> {
         self.compute_tables(&mut file_offset, p_vaddr)?;
 
         self.eh.e_shnum = self.sections.len() as u16;
+        self.eh.e_phnum = self.program_headers.len() as u16;
         // last section is the section header string table
         self.eh.e_shstrndx = self.eh.e_shnum - 1;
         self.eh.e_shoff = file_offset;
@@ -722,11 +671,9 @@ impl<'d> Writer<'d> {
             log::trace!("0x{:x}: ---- section {} ----\n{:#?}", offset, i, section.sh);
             offset += section.sh.serialize(&mut self.out);
         }
-        for (i, section) in self.sections.iter().enumerate() {
-            if let Some(ph) = section.ph {
-                log::trace!("0x{:x}: ---- prog header {} ----\n{:#?}", offset, i, ph);
-                offset += ph.serialize(&mut self.out);
-            }
+        for (i, ph) in self.program_headers.iter().enumerate() {
+            log::trace!("0x{:x}: ---- prog header {} ----\n{:#?}", offset, i, ph);
+            offset += ph.serialize(&mut self.out);
         }
     }
 }
@@ -739,20 +686,21 @@ const fn round_to(val: u64, multiple: u64) -> u64 {
     val + if rem != 0 { multiple - rem } else { 0 }
 }
 
-fn get_program_header(sh: &SectionHeader) -> Option<ProgramHeader> {
-    if sh.sh_flags as u32 & SHF_ALLOC == SHF_ALLOC {
+fn get_program_header(sh: &mut SectionHeader, p_vaddr: &mut u64) -> Option<ProgramHeader> {
+    if sh.sh_size != 0 && sh.sh_flags as u32 & SHF_ALLOC == SHF_ALLOC {
         let write = if sh.sh_flags as u32 & SHF_WRITE == SHF_WRITE { PF_W } else { 0 };
         let exec = if sh.sh_flags as u32 & SHF_EXECINSTR == SHF_EXECINSTR { PF_X } else { 0 };
+        *p_vaddr = round_to(*p_vaddr, sh.sh_addralign);
+        sh.sh_addr = *p_vaddr;
         Some(ProgramHeader {
-            p_type: PT_LOAD,
+            p_type: if sh.sh_type == SHT_DYNAMIC { PT_DYNAMIC } else { PT_LOAD },
             p_flags: PF_R | write | exec,
-            p_align: PAGE_SIZE,
-            // all of these are patched later
-            p_offset: 0,
-            p_vaddr: 0,
-            p_paddr: 0,
-            p_filesz: 0,
-            p_memsz: 0,
+            p_align: sh.sh_addralign,
+            p_offset: sh.sh_offset,
+            p_vaddr: *p_vaddr,
+            p_paddr: post_inc(p_vaddr, sh.sh_size),
+            p_filesz: if sh.sh_type == SHT_NOBITS { 0 } else { sh.sh_size },
+            p_memsz: sh.sh_size,
         })
     } else {
         None
@@ -764,4 +712,10 @@ fn format_list(v: &[String]) -> String {
     s += &v.join(", ");
     s += "]";
     s
+}
+
+fn post_inc(v: &mut u64, inc: u64) -> u64 {
+    let tmp = *v;
+    *v += inc;
+    tmp
 }

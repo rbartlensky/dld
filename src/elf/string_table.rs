@@ -75,7 +75,6 @@ impl StringTable {
                 sh_size: self.total_len() as u64,
                 ..Default::default()
             },
-            ph: None,
             data: section,
         }
     }
