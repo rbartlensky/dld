@@ -2,7 +2,7 @@ use crate::{error::ErrorType, name::Name, serialize::Serialize, symbol::Symbol};
 use byteorder::{LittleEndian, WriteBytesExt};
 use goblin::elf64::{
     header::{Header, ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64, ET_EXEC, EV_CURRENT},
-    program_header::{ProgramHeader, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_LOAD},
+    program_header::{ProgramHeader, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD},
     reloc::{Rela, R_X86_64_TLSGD},
     section_header::{
         SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_UNDEF, SHT_DYNAMIC, SHT_DYNSYM,
@@ -517,7 +517,8 @@ impl<'d> Writer<'d> {
             sh_addr: 0,
         };
         self.sections.push(Section { sh, data: section });
-        self.program_headers.push(get_program_header(&mut sh, p_vaddr).unwrap());
+        self.program_headers
+            .push(get_program_header(&self.section_names, &mut sh, p_vaddr).unwrap());
 
         // prepare .dynstr section and segment
         let mut sec = self.dyn_symbol_names.section_header(dyn_strtab_name as u32);
@@ -525,7 +526,8 @@ impl<'d> Writer<'d> {
         sec.sh.sh_offset = post_inc(file_offset, sec.sh.sh_size);
         sec.sh.sh_addralign = 1;
         let dyn_strtab_vaddr = *p_vaddr;
-        self.program_headers.push(get_program_header(&mut sec.sh, p_vaddr).unwrap());
+        self.program_headers
+            .push(get_program_header(&self.section_names, &mut sec.sh, p_vaddr).unwrap());
         self.sections.push(sec);
 
         // prepare .dynamic section and segment
@@ -548,7 +550,8 @@ impl<'d> Writer<'d> {
             ..Default::default()
         };
         self.sections.push(Section { sh, data: section });
-        self.program_headers.push(get_program_header(&mut sh, p_vaddr).unwrap());
+        self.program_headers
+            .push(get_program_header(&self.section_names, &mut sh, p_vaddr).unwrap());
 
         // serialize symbols and make sure that locals come first
         let mut section = vec![];
@@ -624,7 +627,8 @@ impl<'d> Writer<'d> {
         let sections_len = self.sections.len();
         for section in &mut self.sections {
             section.sh.sh_offset = file_offset;
-            if let Some(ph) = get_program_header(&mut section.sh, &mut p_vaddr) {
+            if let Some(ph) = get_program_header(&self.section_names, &mut section.sh, &mut p_vaddr)
+            {
                 self.program_headers.push(ph);
             }
             file_offset += section.data.len() as u64;
@@ -686,14 +690,18 @@ const fn round_to(val: u64, multiple: u64) -> u64 {
     val + if rem != 0 { multiple - rem } else { 0 }
 }
 
-fn get_program_header(sh: &mut SectionHeader, p_vaddr: &mut u64) -> Option<ProgramHeader> {
+fn get_program_header(
+    names: &StringTable,
+    sh: &mut SectionHeader,
+    p_vaddr: &mut u64,
+) -> Option<ProgramHeader> {
     if sh.sh_size != 0 && sh.sh_flags as u32 & SHF_ALLOC == SHF_ALLOC {
         let write = if sh.sh_flags as u32 & SHF_WRITE == SHF_WRITE { PF_W } else { 0 };
         let exec = if sh.sh_flags as u32 & SHF_EXECINSTR == SHF_EXECINSTR { PF_X } else { 0 };
         *p_vaddr = round_to(*p_vaddr, sh.sh_addralign);
         sh.sh_addr = *p_vaddr;
         Some(ProgramHeader {
-            p_type: if sh.sh_type == SHT_DYNAMIC { PT_DYNAMIC } else { PT_LOAD },
+            p_type: p_type(names, sh),
             p_flags: PF_R | write | exec,
             p_align: sh.sh_addralign,
             p_offset: sh.sh_offset,
@@ -704,6 +712,14 @@ fn get_program_header(sh: &mut SectionHeader, p_vaddr: &mut u64) -> Option<Progr
         })
     } else {
         None
+    }
+}
+
+fn p_type(names: &StringTable, sh: &SectionHeader) -> u32 {
+    match sh.sh_type {
+        SHT_DYNAMIC => PT_DYNAMIC,
+        _ if names.name(sh.sh_name as usize).unwrap() as &str == ".interp" => PT_INTERP,
+        _ => PT_LOAD,
     }
 }
 
