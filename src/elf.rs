@@ -6,7 +6,8 @@ use goblin::elf64::{
     reloc::{Rela, R_X86_64_TLSGD},
     section_header::{
         SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_UNDEF, SHT_DYNAMIC, SHT_DYNSYM,
-        SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_RELA, SHT_SYMTAB,
+        SHT_FINI_ARRAY, SHT_GNU_HASH, SHT_HASH, SHT_INIT_ARRAY, SHT_NOBITS, SHT_NULL, SHT_PROGBITS,
+        SHT_RELA, SHT_SYMTAB,
     },
     sym::{Sym, STB_GLOBAL, STB_LOCAL},
 };
@@ -100,11 +101,13 @@ pub enum DynTag {
     /// Array with addresses of fini fct
     FiniArray = 26,
     /// Size in bytes of DT_INIT_ARRAY
-    InitArraysz = 27,
+    InitArraySize = 27,
     /// Size in bytes of DT_FINI_ARRAY
-    FiniArraysz = 28,
+    FiniArraySize = 28,
     /// Library search path
     Runpath = 29,
+    /// GNU-style hash table
+    GnuHash = 0x6fff_fef5,
 }
 
 pub struct Writer<'d> {
@@ -194,6 +197,7 @@ impl<'d> Writer<'d> {
             ..Default::default()
         };
         s.add_section(".interp", &interp_section, Some(loader));
+        s.add_needed(options.dynamic_linker.file_name().unwrap().to_str().unwrap());
 
         let null_sym = Sym { st_shndx: SHN_UNDEF as u16, ..Default::default() };
         s.add_symbol(null_sym, None, "", Path::new("")).unwrap();
@@ -619,8 +623,6 @@ impl<'d> Writer<'d> {
         self.compute_got_plt();
         self.compute_plt();
 
-        self.handle_special_symbols();
-
         let mut p_vaddr = self.eh.e_entry;
         // patch section and program headers
         let mut file_offset = size_of::<Header>() as u64;
@@ -631,6 +633,7 @@ impl<'d> Writer<'d> {
             {
                 self.program_headers.push(ph);
             }
+            try_add_dyn_entries(&mut self.dyn_entries, &self.section_names, &section.sh);
             file_offset += section.data.len() as u64;
             if self.section_names.name(section.sh.sh_name as usize).unwrap().starts_with(".rel") {
                 // the symbol table is the last section
@@ -638,6 +641,8 @@ impl<'d> Writer<'d> {
                 section.sh.sh_link = sections_len as u32 - 1 + 6;
             }
         }
+
+        self.handle_special_symbols();
 
         // we need to first patch all section headers before we
         // serialize our symbols. This is because we need to set symbol values
@@ -713,6 +718,23 @@ fn get_program_header(
     } else {
         None
     }
+}
+
+fn try_add_dyn_entries(entries: &mut Vec<(DynTag, u64)>, names: &StringTable, sh: &SectionHeader) {
+    let name = names.name(sh.sh_name as usize).unwrap();
+    match &name as &str {
+        ".init" => entries.push((DynTag::Init, sh.sh_addr)),
+        ".fini" => entries.push((DynTag::Fini, sh.sh_addr)),
+        _ => match sh.sh_type {
+            SHT_INIT_ARRAY => entries
+                .extend(&[(DynTag::InitArray, sh.sh_addr), (DynTag::InitArraySize, sh.sh_size)]),
+            SHT_FINI_ARRAY => entries
+                .extend(&[(DynTag::FiniArray, sh.sh_addr), (DynTag::FiniArraySize, sh.sh_size)]),
+            SHT_HASH => entries.push((DynTag::Hash, sh.sh_addr)),
+            SHT_GNU_HASH => entries.push((DynTag::GnuHash, sh.sh_addr)),
+            _ => {}
+        },
+    };
 }
 
 fn p_type(names: &StringTable, sh: &SectionHeader) -> u32 {
