@@ -43,3 +43,20 @@ impl Hash for Name {
         self.deref().hash(state);
     }
 }
+
+impl Name {
+    // https://docs.oracle.com/cd/E23824_01/html/819-0690/chapter6-48031.html
+    pub fn elf_hash(&self) -> u32 {
+        let mut h = 0;
+        let mut g;
+        for b in (self as &str).as_bytes() {
+            h = (h << 4) + (*b as u32);
+            g = h & 0xf0000000;
+            if g != 0 {
+                h ^= g >> 24;
+            }
+            h &= !g;
+        }
+        h
+    }
+}

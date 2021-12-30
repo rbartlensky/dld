@@ -20,7 +20,7 @@ mod string_table;
 pub use string_table::StringTable;
 
 mod symbol_table;
-pub use symbol_table::{SymbolRef, SymbolTable};
+pub use symbol_table::{SymbolRef, SymbolTable, HashTable};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SectionRef {
@@ -289,17 +289,18 @@ impl<'d> Writer<'d> {
         symbol_names: &mut StringTable,
         symbols: &mut SymbolTable<'d>,
     ) -> Result<Option<SymbolRef>, ErrorType> {
-        let name = name.to_string();
+        let name: Name = name.to_string().into();
+        let hash = name.elf_hash();
         let st_name = symbol_names.get_or_create(name.clone()).offset as u32;
         elf_sym.st_name = st_name;
-        log::trace!("name: '{}' -> sym: {:?}", name, elf_sym);
+        log::trace!("name: '{}' -> sym: {:?}", &name as &str, elf_sym);
         if let Some(sec_ref) = sec_ref {
             elf_sym.st_shndx = sec_ref.index as u16;
             elf_sym.st_value += sec_ref.insertion_point as u64;
         }
         symbols
-            .add_symbol(elf_sym, reference)
-            .map_err(|e| ErrorType::Other(format!("{} {}", name, e)))
+            .add_symbol(elf_sym, hash, reference)
+            .map_err(|e| ErrorType::Other(format!("{} {}", &name as &str, e)))
     }
 
     pub fn add_symbol<'s>(
@@ -498,7 +499,7 @@ impl<'d> Writer<'d> {
         let mut section = vec![];
         let syms = self.dyn_symbols.sorted();
         let mut last_local = 0;
-        for sym in syms {
+        for sym in &syms {
             let st_bind = sym.st_info >> 4;
             sym.serialize(&mut section);
             if st_bind == STB_LOCAL {
@@ -528,10 +529,19 @@ impl<'d> Writer<'d> {
         let mut sec = self.dyn_symbol_names.section_header(dyn_strtab_name as u32);
         sec.sh.sh_flags |= SHF_ALLOC as u64;
         sec.sh.sh_offset = post_inc(file_offset, sec.sh.sh_size);
-        sec.sh.sh_addralign = 1;
         let dyn_strtab_vaddr = *p_vaddr;
         self.program_headers
             .push(get_program_header(&self.section_names, &mut sec.sh, p_vaddr).unwrap());
+        self.sections.push(sec);
+
+        // prepare .hash section
+        let hash_name = self.section_names.get_or_create(".hash").offset;
+        let mut sec = SymbolTable::hash_section(hash_name as u32, &syms[..]);
+        sec.sh.sh_offset = post_inc(file_offset, sec.sh.sh_size);
+        sec.sh.sh_link = (self.sections.len() - 2) as u32;
+        self.program_headers
+            .push(get_program_header(&self.section_names, &mut sec.sh, p_vaddr).unwrap());
+        try_add_dyn_entries(&mut self.dyn_entries, &self.section_names, &sec.sh);
         self.sections.push(sec);
 
         // prepare .dynamic section and segment
@@ -722,7 +732,7 @@ fn get_program_header(
 
 fn try_add_dyn_entries(entries: &mut Vec<(DynTag, u64)>, names: &StringTable, sh: &SectionHeader) {
     let name = names.name(sh.sh_name as usize).unwrap();
-    match &name as &str {
+    match name as &str {
         ".init" => entries.push((DynTag::Init, sh.sh_addr)),
         ".fini" => entries.push((DynTag::Fini, sh.sh_addr)),
         _ => match sh.sh_type {

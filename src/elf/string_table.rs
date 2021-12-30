@@ -73,6 +73,7 @@ impl StringTable {
                 sh_name,
                 sh_type: SHT_STRTAB,
                 sh_size: self.total_len() as u64,
+                sh_addralign: 1,
                 ..Default::default()
             },
             data: section,

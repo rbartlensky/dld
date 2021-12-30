@@ -108,3 +108,14 @@ impl<W: Write> Serialize<W> for (crate::elf::DynTag, u64) {
         size_of::<u64>() * 2
     }
 }
+
+impl<W: Write> Serialize<W> for crate::elf::HashTable {
+    fn serialize(&self, buf: &mut W) -> usize {
+        buf.write_u32::<LittleEndian>(self.nbuckets).unwrap();
+        buf.write_u32::<LittleEndian>(self.nchains).unwrap();
+        for v in self.buckets.iter().chain(self.chains.iter()) {
+            buf.write_u32::<LittleEndian>(*v).unwrap();
+        }
+        size_of::<u32>() * (self.nbuckets as usize + self.nchains as usize + 2)
+    }
+}

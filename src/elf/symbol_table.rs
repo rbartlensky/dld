@@ -1,6 +1,10 @@
 use crate::elf::Symbol;
+use crate::serialize::Serialize;
 
-use goblin::elf64::{section_header::SHN_UNDEF, sym::Sym};
+use goblin::elf64::{
+    section_header::{SectionHeader, SHF_ALLOC, SHN_UNDEF, SHT_HASH},
+    sym::Sym,
+};
 use std::{
     cmp::Ordering,
     collections::{hash_map::Entry, HashMap},
@@ -30,10 +34,11 @@ impl<'p> SymbolTable<'p> {
     pub fn add_symbol(
         &mut self,
         elf_sym: Sym,
+        hash: u32,
         reference: &'p Path,
     ) -> Result<Option<SymbolRef>, Error> {
         let st_name = elf_sym.st_name;
-        let new_sym = Symbol::new(elf_sym, reference);
+        let new_sym = Symbol::new(elf_sym, hash, reference);
         match self.symbols.entry(st_name) {
             Entry::Occupied(mut s) => {
                 let old_sym = s.get_mut();
@@ -75,10 +80,44 @@ impl<'p> SymbolTable<'p> {
         self.symbols.get_mut(&s.st_name)
     }
 
-    pub fn sorted(&mut self) -> Vec<&mut Sym> {
-        let mut syms: Vec<&mut Sym> = self.symbols.values_mut().map(|s| &mut s.sym).collect();
-        syms.sort_by(|s1, s2| sort_symbols_func(s1, s2));
+    pub fn sorted(&mut self) -> Vec<&mut Symbol<'p>> {
+        let mut syms: Vec<&mut Symbol<'p>> = self.symbols.values_mut().collect();
+        syms.sort_by(|s1, s2| sort_symbols_func(&s1.sym, &s2.sym));
         syms
+    }
+
+    pub fn hash_section(sh_name: u32, symbols: &[&mut Symbol]) -> super::Section {
+        let nbuckets: u32 = symbols.len() as u32 / 2;
+        let mut buckets = vec![0; nbuckets as usize];
+        let mut chains = vec![0_u32; symbols.len()];
+        for (symbol_index, symbol) in symbols.iter().enumerate() {
+            let bucket_index = (symbol.hash() % nbuckets) as usize;
+            if buckets[bucket_index] == 0 {
+                buckets[bucket_index] = symbol_index as u32;
+            } else {
+                let mut chain_index = bucket_index;
+                let mut next_chain = chains[bucket_index];
+                while next_chain != 0 {
+                    chain_index = chains[next_chain as usize] as usize;
+                    next_chain = chains[chain_index];
+                }
+                chains[chain_index] = symbol_index as u32;
+            }
+        }
+        let mut data = Vec::with_capacity(nbuckets as usize + chains.len() + 2);
+        HashTable::new(buckets, chains).serialize(&mut data);
+        super::Section {
+            sh: SectionHeader {
+                sh_name,
+                sh_type: SHT_HASH,
+                sh_size: data.len() as u64,
+                sh_entsize: std::mem::size_of::<u32>() as u64,
+                sh_flags: SHF_ALLOC as u64,
+                sh_addralign: std::mem::align_of::<u32>() as u64,
+                ..Default::default()
+            },
+            data,
+        }
     }
 }
 
@@ -107,5 +146,18 @@ fn sort_symbols_func(s1: &Sym, s2: &Sym) -> Ordering {
     match b1.cmp(&b2) {
         Ordering::Equal => t1.cmp(&t2),
         c => c,
+    }
+}
+
+pub struct HashTable {
+    pub nbuckets: u32,
+    pub nchains: u32,
+    pub buckets: Vec<u32>,
+    pub chains: Vec<u32>,
+}
+
+impl HashTable {
+    pub fn new(buckets: Vec<u32>, chains: Vec<u32>) -> Self {
+        Self { nbuckets: buckets.len() as u32, nchains: chains.len() as u32, buckets, chains }
     }
 }
