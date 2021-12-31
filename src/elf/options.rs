@@ -30,7 +30,7 @@ impl Default for BuildId {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashStyle {
     Sysv,
     Gnu,

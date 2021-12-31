@@ -2,12 +2,13 @@ use crate::elf::Symbol;
 use crate::serialize::Serialize;
 
 use goblin::elf64::{
-    section_header::{SectionHeader, SHF_ALLOC, SHN_UNDEF, SHT_HASH},
+    section_header::{SectionHeader, SHF_ALLOC, SHN_UNDEF, SHT_GNU_HASH, SHT_HASH},
     sym::Sym,
 };
 use std::{
     cmp::Ordering,
     collections::{hash_map::Entry, HashMap},
+    mem::size_of,
     ops::Deref,
     path::{Path, PathBuf},
 };
@@ -35,10 +36,11 @@ impl<'p> SymbolTable<'p> {
         &mut self,
         elf_sym: Sym,
         hash: u32,
+        gnu_hash: u32,
         reference: &'p Path,
     ) -> Result<Option<SymbolRef>, Error> {
         let st_name = elf_sym.st_name;
-        let new_sym = Symbol::new(elf_sym, hash, reference);
+        let new_sym = Symbol::new(elf_sym, hash, gnu_hash, reference);
         match self.symbols.entry(st_name) {
             Entry::Occupied(mut s) => {
                 let old_sym = s.get_mut();
@@ -82,7 +84,7 @@ impl<'p> SymbolTable<'p> {
 
     pub fn sorted(&mut self) -> Vec<&mut Symbol<'p>> {
         let mut syms: Vec<&mut Symbol<'p>> = self.symbols.values_mut().collect();
-        syms.sort_by(|s1, s2| sort_symbols_func(&s1.sym, &s2.sym));
+        syms.sort_by(|s1, s2| sort_symbols_func(&s1, &s2));
         syms
     }
 
@@ -119,6 +121,77 @@ impl<'p> SymbolTable<'p> {
             data,
         }
     }
+
+    pub fn gnu_hash_section(sh_name: u32, symbols: &[&mut Symbol]) -> super::Section {
+        // should be 32 for elf32, but for now we only support 64 bit anyways
+        let elfclass_bits = 64;
+        // TODO: figure out a good numbers here
+        let bloom_size = 5;
+        let bloom_shift = 5;
+        let nbuckets: u32 = symbols.len() as u32 / 2 + 1;
+        // we always skip the first null symbol. For now, since we don't have
+        // any locals in `.dynsym`, we can set this to 1, since we skip 1 symbol only.
+        let symbol_offset = 1;
+
+        // create a bloom filter
+        let mut bloom = vec![0_u64; bloom_size as usize];
+        for sym in &symbols[symbol_offset..] {
+            let hash = sym.gnu_hash();
+            let index = ((sym.gnu_hash() / elfclass_bits) % bloom_size) as usize;
+            bloom[index] |= 1_u64 << (hash % elfclass_bits);
+            bloom[index] |= 1_u64 << ((hash >> bloom_shift) % elfclass_bits);
+        }
+
+        // prepare the buckets
+        let mut buckets = vec![0_u32; nbuckets as usize];
+        for (i, sym) in symbols.iter().enumerate().skip(symbol_offset) {
+            let index = (sym.gnu_hash() % nbuckets) as usize;
+            if buckets[index] == 0 {
+                buckets[index] = i as u32;
+            }
+        }
+
+        // prepare the chains
+        let mut chains = vec![0_u32; symbols.len()];
+        for (i, sym) in symbols.iter().enumerate().skip(symbol_offset) {
+            // the last value in a chain doesn't have the last bit set, but
+            // how do we know if this sym is the last in the chain?
+            // since the symbols are sorted by gnu_hash, it means that if
+            // this symbol's gnu_hash is different than the gnu_hash of the next symbol,
+            // then there is no other symbol that has the same gnu_hash as our
+            // current symbol
+            let value = if i == symbols.len() - 1 || sym.gnu_hash() != symbols[i + 1].gnu_hash() {
+                sym.gnu_hash() | 1
+            } else {
+                sym.gnu_hash() & !1
+            };
+            chains.push(value);
+        }
+
+        let ght = GnuHashTable {
+            nbuckets,
+            buckets,
+            sym_offset: symbol_offset as u32,
+            bloom_shift,
+            bloom_size,
+            bloom,
+            chains,
+        };
+        let mut data = Vec::with_capacity(ght.size());
+        ght.serialize(&mut data);
+        super::Section {
+            sh: SectionHeader {
+                sh_name,
+                sh_type: SHT_GNU_HASH,
+                sh_size: data.len() as u64,
+                sh_entsize: std::mem::size_of::<u32>() as u64,
+                sh_flags: SHF_ALLOC as u64,
+                sh_addralign: std::mem::align_of::<u32>() as u64,
+                ..Default::default()
+            },
+            data,
+        }
+    }
 }
 
 impl<'p> Deref for SymbolTable<'p> {
@@ -138,13 +211,16 @@ fn st_bind(st_info: u8) -> u8 {
 }
 
 // local before global, notype before other types
-fn sort_symbols_func(s1: &Sym, s2: &Sym) -> Ordering {
+fn sort_symbols_func(s1: &Symbol, s2: &Symbol) -> Ordering {
     let b1 = st_bind(s1.st_info);
     let b2 = st_bind(s2.st_info);
     let t1 = st_type(s1.st_info);
     let t2 = st_type(s2.st_info);
     match b1.cmp(&b2) {
-        Ordering::Equal => t1.cmp(&t2),
+        Ordering::Equal => match s1.gnu_hash().cmp(&s2.gnu_hash()) {
+            Ordering::Equal => t1.cmp(&t2),
+            c => c,
+        },
         c => c,
     }
 }
@@ -159,5 +235,22 @@ pub struct HashTable {
 impl HashTable {
     pub fn new(buckets: Vec<u32>, chains: Vec<u32>) -> Self {
         Self { nbuckets: buckets.len() as u32, nchains: chains.len() as u32, buckets, chains }
+    }
+}
+
+pub struct GnuHashTable {
+    pub nbuckets: u32,
+    pub buckets: Vec<u32>,
+    pub sym_offset: u32,
+    pub bloom_size: u32,
+    pub bloom_shift: u32,
+    pub bloom: Vec<u64>,
+    pub chains: Vec<u32>,
+}
+
+impl GnuHashTable {
+    pub fn size(&self) -> usize {
+        (self.nbuckets as usize + 4 + self.chains.len()) * size_of::<u32>()
+            + self.bloom_size as usize * size_of::<u64>()
     }
 }

@@ -119,3 +119,19 @@ impl<W: Write> Serialize<W> for crate::elf::HashTable {
         size_of::<u32>() * (self.nbuckets as usize + self.nchains as usize + 2)
     }
 }
+
+impl<W: Write> Serialize<W> for crate::elf::GnuHashTable {
+    fn serialize(&self, buf: &mut W) -> usize {
+        buf.write_u32::<LittleEndian>(self.nbuckets).unwrap();
+        buf.write_u32::<LittleEndian>(self.sym_offset).unwrap();
+        buf.write_u32::<LittleEndian>(self.bloom_size).unwrap();
+        buf.write_u32::<LittleEndian>(self.bloom_shift).unwrap();
+        for v in &self.bloom {
+            buf.write_u64::<LittleEndian>(*v).unwrap();
+        }
+        for v in self.buckets.iter().chain(self.chains.iter()) {
+            buf.write_u32::<LittleEndian>(*v).unwrap();
+        }
+        self.size()
+    }
+}

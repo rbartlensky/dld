@@ -12,6 +12,7 @@ use goblin::{
 pub struct Symbol<'r> {
     pub sym: Sym,
     hash: u32,
+    gnu_hash: u32,
     reference: &'r Path,
     in_got: Option<usize>,
     in_plt: Option<usize>,
@@ -19,8 +20,8 @@ pub struct Symbol<'r> {
 }
 
 impl<'r> Symbol<'r> {
-    pub fn new(sym: Sym, hash: u32, reference: &'r Path) -> Self {
-        Self { sym, reference, hash, in_got: None, in_plt: None, in_got_plt: None }
+    pub fn new(sym: Sym, hash: u32, gnu_hash: u32, reference: &'r Path) -> Self {
+        Self { sym, reference, hash, gnu_hash, in_got: None, in_plt: None, in_got_plt: None }
     }
 
     pub const fn st_bind(&self) -> u8 {
@@ -89,6 +90,10 @@ impl<'r> Symbol<'r> {
 
     pub fn hash(&self) -> u32 {
         self.hash
+    }
+
+    pub fn gnu_hash(&self) -> u32 {
+        self.gnu_hash
     }
 }
 

@@ -20,7 +20,7 @@ mod string_table;
 pub use string_table::StringTable;
 
 mod symbol_table;
-pub use symbol_table::{SymbolRef, SymbolTable, HashTable};
+pub use symbol_table::{GnuHashTable, HashTable, SymbolRef, SymbolTable};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SectionRef {
@@ -112,6 +112,7 @@ pub enum DynTag {
 
 pub struct Writer<'d> {
     out: File,
+    hash_style: options::HashStyle,
     eh: Header,
     section_names: StringTable,
     symbol_names: StringTable,
@@ -154,6 +155,7 @@ impl<'d> Writer<'d> {
         };
         let mut s = Self {
             out,
+            hash_style: options.hash_style,
             eh,
             section_names: Default::default(),
             symbol_names: Default::default(),
@@ -291,6 +293,7 @@ impl<'d> Writer<'d> {
     ) -> Result<Option<SymbolRef>, ErrorType> {
         let name: Name = name.to_string().into();
         let hash = name.elf_hash();
+        let gnu_hash = name.elf_gnu_hash();
         let st_name = symbol_names.get_or_create(name.clone()).offset as u32;
         elf_sym.st_name = st_name;
         log::trace!("name: '{}' -> sym: {:?}", &name as &str, elf_sym);
@@ -299,7 +302,7 @@ impl<'d> Writer<'d> {
             elf_sym.st_value += sec_ref.insertion_point as u64;
         }
         symbols
-            .add_symbol(elf_sym, hash, reference)
+            .add_symbol(elf_sym, hash, gnu_hash, reference)
             .map_err(|e| ErrorType::Other(format!("{} {}", &name as &str, e)))
     }
 
@@ -535,14 +538,26 @@ impl<'d> Writer<'d> {
         self.sections.push(sec);
 
         // prepare .hash section
-        let hash_name = self.section_names.get_or_create(".hash").offset;
-        let mut sec = SymbolTable::hash_section(hash_name as u32, &syms[..]);
-        sec.sh.sh_offset = post_inc(file_offset, sec.sh.sh_size);
-        sec.sh.sh_link = (self.sections.len() - 2) as u32;
-        self.program_headers
-            .push(get_program_header(&self.section_names, &mut sec.sh, p_vaddr).unwrap());
-        try_add_dyn_entries(&mut self.dyn_entries, &self.section_names, &sec.sh);
-        self.sections.push(sec);
+        if self.hash_style == HashStyle::Sysv || self.hash_style == HashStyle::Both {
+            let hash_name = self.section_names.get_or_create(".hash").offset;
+            let mut sec = SymbolTable::hash_section(hash_name as u32, &syms[..]);
+            sec.sh.sh_offset = post_inc(file_offset, sec.sh.sh_size);
+            sec.sh.sh_link = (self.sections.len() - 2) as u32;
+            self.program_headers
+                .push(get_program_header(&self.section_names, &mut sec.sh, p_vaddr).unwrap());
+            try_add_dyn_entries(&mut self.dyn_entries, &self.section_names, &sec.sh);
+            self.sections.push(sec);
+        }
+        if self.hash_style == HashStyle::Gnu || self.hash_style == HashStyle::Both {
+            let hash_name = self.section_names.get_or_create(".gnu.hash").offset;
+            let mut sec = SymbolTable::gnu_hash_section(hash_name as u32, &syms[..]);
+            sec.sh.sh_offset = post_inc(file_offset, sec.sh.sh_size);
+            sec.sh.sh_link = (self.sections.len() - 3) as u32;
+            self.program_headers
+                .push(get_program_header(&self.section_names, &mut sec.sh, p_vaddr).unwrap());
+            try_add_dyn_entries(&mut self.dyn_entries, &self.section_names, &sec.sh);
+            self.sections.push(sec);
+        }
 
         // prepare .dynamic section and segment
         self.dyn_entries.push((DynTag::Strtab, dyn_strtab_vaddr));
