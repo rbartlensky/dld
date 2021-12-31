@@ -376,14 +376,12 @@ fn apply_relocation(
                 (got_offset, R_X86_64_DTPMOD64),
                 (got_offset + size_of::<u64>(), R_X86_64_DTPMOD64),
             ] {
-                writer.add_relocation(
-                    ".got",
-                    Rela {
-                        r_offset: got_offset as u64,
-                        r_info: (rel.r_sym << 8) as u64 + ty as u64,
-                        r_addend: 0,
-                    },
-                );
+                // XXX:
+                writer.add_dyn_relocation(Rela {
+                    r_offset: got_offset as u64,
+                    r_info: (rel.r_sym << 8) as u64 + ty as u64,
+                    r_addend: 0,
+                });
             }
         }
         R_X86_64_GOTTPOFF => {
@@ -392,14 +390,12 @@ fn apply_relocation(
             let mut section_offset = writer.section_offset(section_index, rel.r_offset as usize);
             let value = got_offset as i64 + got + a - p;
             section_offset.write_i32::<LittleEndian>(value.try_into().unwrap()).unwrap();
-            writer.add_relocation(
-                ".got",
-                Rela {
-                    r_offset: (got_offset as i64 + got) as u64,
-                    r_info: (rel.r_sym << 8) as u64 + R_X86_64_TPOFF64 as u64,
-                    r_addend: 0,
-                },
-            );
+            // XXX:
+            writer.add_dyn_relocation(Rela {
+                r_offset: (got_offset as i64 + got) as u64,
+                r_info: (rel.r_sym << 8) as u64 + R_X86_64_TPOFF64 as u64,
+                r_addend: 0,
+            });
         }
         R_X86_64_TPOFF32 => {
             let mut section_offset = writer.section_offset(section_index, rel.r_offset as usize);
