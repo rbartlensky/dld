@@ -63,9 +63,9 @@ pub enum DynTag {
     /// Address of Rela relocs
     Rela = 7,
     /// Total size of Rela relocs
-    Relasz = 8,
+    RelaSize = 8,
     /// Size of one Rela reloc
-    Relaent = 9,
+    RelaEnt = 9,
     /// Size of string table
     Strsz = 10,
     /// Size of one symbol table entry
@@ -585,6 +585,7 @@ impl<'d> Writer<'d> {
             self.sections.push(Section { sh, data: section });
             self.program_headers
                 .push(get_program_header(&self.section_names, &mut sh, &mut self.p_vaddr).unwrap());
+            try_add_dyn_entries(&mut self.dyn_entries, &self.section_names, &sh);
         }
 
         // prepare .dynamic section and segment
@@ -786,6 +787,11 @@ fn try_add_dyn_entries(entries: &mut Vec<(DynTag, u64)>, names: &StringTable, sh
     match name as &str {
         ".init" => entries.push((DynTag::Init, sh.sh_addr)),
         ".fini" => entries.push((DynTag::Fini, sh.sh_addr)),
+        ".rela.dyn" => {
+            entries.push((DynTag::Rela, sh.sh_addr));
+            entries.push((DynTag::RelaEnt, sh.sh_entsize));
+            entries.push((DynTag::RelaSize, sh.sh_size));
+        }
         _ => match sh.sh_type {
             SHT_INIT_ARRAY => entries
                 .extend(&[(DynTag::InitArray, sh.sh_addr), (DynTag::InitArraySize, sh.sh_size)]),
