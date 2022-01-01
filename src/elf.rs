@@ -119,13 +119,17 @@ pub struct Writer<'d> {
     symbols: SymbolTable<'d>,
     dyn_symbol_names: StringTable,
     dyn_symbols: SymbolTable<'d>,
-    dyn_rels: Vec<Rela>,
+    // a mapping from a symbol with name "foo" to a dynamic symbol with the same name
+    symbol_mapping: HashMap<SymbolRef, SymbolRef>,
+    dyn_rels: Vec<(Rela, SymbolRef)>,
     sections: Vec<Section>,
     got_len: usize,
     plt: HashMap<SymbolRef, usize>,
     got_plt: HashMap<SymbolRef, usize>,
     dyn_entries: Vec<(DynTag, u64)>,
     program_headers: Vec<ProgramHeader>,
+    p_vaddr: u64,
+    file_offset: u64,
 }
 
 impl<'d> Writer<'d> {
@@ -164,6 +168,7 @@ impl<'d> Writer<'d> {
             dyn_symbol_names: Default::default(),
             dyn_symbols: Default::default(),
             dyn_rels: vec![],
+            symbol_mapping: Default::default(),
             sections: Default::default(),
             // first entry reserved
             got_len: 1,
@@ -171,6 +176,8 @@ impl<'d> Writer<'d> {
             got_plt: Default::default(),
             dyn_entries: vec![],
             program_headers: vec![],
+            p_vaddr: eh.e_entry,
+            file_offset: size_of::<Header>() as u64,
         };
 
         let null_section = goblin::elf::SectionHeader { sh_type: SHT_NULL, ..Default::default() };
@@ -178,6 +185,7 @@ impl<'d> Writer<'d> {
         let got_section = goblin::elf::SectionHeader {
             sh_type: SHT_PROGBITS,
             sh_flags: (SHF_ALLOC | SHF_WRITE) as u64,
+            sh_addralign: size_of::<u64>() as u64,
             ..Default::default()
         };
         s.add_section(".got", &got_section, None);
@@ -257,8 +265,8 @@ impl<'d> Writer<'d> {
         self.add_section(name, section, data)
     }
 
-    pub fn add_dyn_relocation(&mut self, r: Rela) {
-        self.dyn_rels.push(r);
+    pub fn add_dyn_relocation(&mut self, r: Rela, sym: SymbolRef) {
+        self.dyn_rels.push((r, sym));
     }
 
     fn add_symbol_inner<'s>(
@@ -311,14 +319,20 @@ impl<'d> Writer<'d> {
         elf_sym.st_shndx = SHN_UNDEF as u16;
         elf_sym.st_size = 0;
         elf_sym.st_value = 0;
-        Self::add_symbol_inner(
+        let r = Self::add_symbol_inner(
             elf_sym,
             sec_ref,
             name,
             reference,
             &mut self.dyn_symbol_names,
             &mut self.dyn_symbols,
-        )
+        );
+        if let Ok(Some(s)) = r {
+            if let Some(entry) = self.symbol_names.get(name.to_string()) {
+                self.symbol_mapping.insert(SymbolRef { st_name: entry.offset as u32 }, s);
+            }
+        }
+        r
     }
 
     pub fn symbol(&self, sym: SymbolRef) -> Symbol<'_> {
@@ -365,11 +379,11 @@ impl<'d> Writer<'d> {
     }
 
     pub fn got_address(&self) -> u64 {
-        self.sections[1].sh.sh_offset
+        self.sections[1].sh.sh_addr
     }
 
     pub fn plt_address(&self) -> u64 {
-        self.sections[3].sh.sh_offset
+        self.sections[3].sh.sh_addr
     }
 
     pub fn add_needed(&mut self, so_name: &str) {
@@ -390,6 +404,7 @@ impl<'d> Writer<'d> {
                 s.st_value = got_addr
             };
         }
+        self.sections[1].sh.sh_size = self.sections[1].data.len() as u64;
     }
 
     fn compute_got_plt(&mut self) {
@@ -398,6 +413,7 @@ impl<'d> Writer<'d> {
         self.sections[2]
             .data
             .extend(std::iter::repeat(0).take(size_of::<u64>() * (self.got_plt.len() + 3)));
+        self.sections[2].sh.sh_size = self.sections[2].data.len() as u64;
     }
 
     fn patch_got_plt(&mut self) {
@@ -446,6 +462,7 @@ impl<'d> Writer<'d> {
             let plt_start_offset = (plt_index + 2) * 16;
             entry[12..].as_mut().write_u32::<LittleEndian>(plt_start_offset).unwrap();
         }
+        self.sections[3].sh.sh_size = self.sections[3].data.len() as u64;
     }
 
     fn handle_special_symbols(&mut self) {
@@ -466,7 +483,7 @@ impl<'d> Writer<'d> {
         }
     }
 
-    fn compute_tables(&mut self, file_offset: &mut u64, mut p_vaddr: u64) -> Result<(), ErrorType> {
+    fn compute_tables(&mut self) -> Result<(), ErrorType> {
         let dyn_symtab_name = self.section_names.get_or_create(".dynsym").offset;
         let dyn_strtab_name = self.section_names.get_or_create(".dynstr").offset;
         let dyn_relocs_name = self.section_names.get_or_create(".rela.dyn").offset;
@@ -475,14 +492,12 @@ impl<'d> Writer<'d> {
         let strtab_name = self.section_names.get_or_create(".strtab").offset;
         let shstrtab_name = self.section_names.get_or_create(".shstrtab").offset;
 
-        let p_vaddr = &mut p_vaddr;
-
         // prepare .dynsym section and segment
         let dyn_sym_section_index = self.sections.len() as u32;
         let mut section = vec![];
-        let syms = self.dyn_symbols.sorted();
+        let syms = self.dyn_symbols.sorted_with_indexes();
         let mut last_local = 0;
-        for sym in &syms {
+        for (_, sym) in syms.values() {
             let st_bind = sym.st_info >> 4;
             sym.serialize(&mut section);
             if st_bind == STB_LOCAL {
@@ -490,7 +505,7 @@ impl<'d> Writer<'d> {
             }
         }
         let alignment = std::mem::align_of::<u64>() as u64;
-        *p_vaddr = round_to(*p_vaddr, alignment);
+        self.p_vaddr = round_to(self.p_vaddr, alignment);
         let len = section.len() as u64;
         let mut sh = SectionHeader {
             sh_name: dyn_symtab_name as u32,
@@ -500,42 +515,45 @@ impl<'d> Writer<'d> {
             sh_entsize: size_of::<Sym>() as u64,
             sh_link: self.sections.len() as u32 + 1,
             sh_flags: SHF_ALLOC as u64,
-            sh_offset: post_inc(file_offset, len),
+            sh_offset: post_inc(&mut self.file_offset, len),
             sh_addralign: alignment,
             sh_addr: 0,
         };
         self.sections.push(Section { sh, data: section });
         self.program_headers
-            .push(get_program_header(&self.section_names, &mut sh, p_vaddr).unwrap());
+            .push(get_program_header(&self.section_names, &mut sh, &mut self.p_vaddr).unwrap());
 
         // prepare .dynstr section and segment
         let dyn_str_section_index = self.sections.len() as u32;
         let mut sec = self.dyn_symbol_names.section_header(dyn_strtab_name as u32);
         sec.sh.sh_flags |= SHF_ALLOC as u64;
-        sec.sh.sh_offset = post_inc(file_offset, sec.sh.sh_size);
-        let dyn_strtab_vaddr = *p_vaddr;
+        sec.sh.sh_offset = post_inc(&mut self.file_offset, sec.sh.sh_size);
+        let dyn_strtab_vaddr = self.p_vaddr;
         self.program_headers
-            .push(get_program_header(&self.section_names, &mut sec.sh, p_vaddr).unwrap());
+            .push(get_program_header(&self.section_names, &mut sec.sh, &mut self.p_vaddr).unwrap());
         self.sections.push(sec);
 
         // prepare .hash section
+        let hash_syms = syms.iter().map(|(_, (_, s))| *s as &_).collect::<Vec<&Symbol>>();
         if self.hash_style == HashStyle::Sysv || self.hash_style == HashStyle::Both {
             let hash_name = self.section_names.get_or_create(".hash").offset;
-            let mut sec = SymbolTable::hash_section(hash_name as u32, &syms[..]);
-            sec.sh.sh_offset = post_inc(file_offset, sec.sh.sh_size);
+            let mut sec = SymbolTable::hash_section(hash_name as u32, &hash_syms);
+            sec.sh.sh_offset = post_inc(&mut self.file_offset, sec.sh.sh_size);
             sec.sh.sh_link = dyn_sym_section_index;
-            self.program_headers
-                .push(get_program_header(&self.section_names, &mut sec.sh, p_vaddr).unwrap());
+            self.program_headers.push(
+                get_program_header(&self.section_names, &mut sec.sh, &mut self.p_vaddr).unwrap(),
+            );
             try_add_dyn_entries(&mut self.dyn_entries, &self.section_names, &sec.sh);
             self.sections.push(sec);
         }
         if self.hash_style == HashStyle::Gnu || self.hash_style == HashStyle::Both {
             let hash_name = self.section_names.get_or_create(".gnu.hash").offset;
-            let mut sec = SymbolTable::gnu_hash_section(hash_name as u32, &syms[..]);
-            sec.sh.sh_offset = post_inc(file_offset, sec.sh.sh_size);
+            let mut sec = SymbolTable::gnu_hash_section(hash_name as u32, &hash_syms);
+            sec.sh.sh_offset = post_inc(&mut self.file_offset, sec.sh.sh_size);
             sec.sh.sh_link = dyn_sym_section_index;
-            self.program_headers
-                .push(get_program_header(&self.section_names, &mut sec.sh, p_vaddr).unwrap());
+            self.program_headers.push(
+                get_program_header(&self.section_names, &mut sec.sh, &mut self.p_vaddr).unwrap(),
+            );
             try_add_dyn_entries(&mut self.dyn_entries, &self.section_names, &sec.sh);
             self.sections.push(sec);
         }
@@ -543,25 +561,30 @@ impl<'d> Writer<'d> {
         // prepare .rela.dyn section
         if !self.dyn_rels.is_empty() {
             let mut section = Vec::with_capacity(self.dyn_rels.len() * size_of::<Rela>());
-            for entry in &self.dyn_rels {
-                entry.serialize(&mut section);
+            for (rela, symbol_ref) in &mut self.dyn_rels {
+                if let Some(dyn_symbol_ref) = self.symbol_mapping.get(symbol_ref) {
+                    let sym = syms[&dyn_symbol_ref.st_name].0 as u64;
+                    rela.r_info += sym << 32;
+                    rela.serialize(&mut section);
+                }
             }
             let len = section.len() as u64;
             let alignment = std::mem::align_of::<u64>() as u64;
-            *p_vaddr = round_to(*p_vaddr, alignment);
+            self.p_vaddr = round_to(self.p_vaddr, alignment);
             let mut sh = SectionHeader {
                 sh_name: dyn_relocs_name as u32,
                 sh_type: SHT_RELA,
                 sh_size: len,
                 sh_entsize: size_of::<Rela>() as u64,
                 sh_flags: SHF_ALLOC as u64,
-                sh_offset: post_inc(file_offset, len),
+                sh_offset: post_inc(&mut self.file_offset, len),
                 sh_addralign: alignment,
+                sh_link: dyn_sym_section_index,
                 ..Default::default()
             };
             self.sections.push(Section { sh, data: section });
             self.program_headers
-                .push(get_program_header(&self.section_names, &mut sh, p_vaddr).unwrap());
+                .push(get_program_header(&self.section_names, &mut sh, &mut self.p_vaddr).unwrap());
         }
 
         // prepare .dynamic section and segment
@@ -573,21 +596,21 @@ impl<'d> Writer<'d> {
         }
         let len = section.len() as u64;
         let alignment = std::mem::align_of::<u64>() as u64;
-        *p_vaddr = round_to(*p_vaddr, alignment);
+        self.p_vaddr = round_to(self.p_vaddr, alignment);
         let mut sh = SectionHeader {
             sh_name: dynamic_name as u32,
             sh_type: SHT_DYNAMIC,
             sh_size: len,
             sh_entsize: size_of::<u64>() as u64 * 2,
             sh_flags: SHF_ALLOC as u64,
-            sh_offset: post_inc(file_offset, len),
+            sh_offset: post_inc(&mut self.file_offset, len),
             sh_addralign: alignment,
             sh_link: dyn_str_section_index,
             ..Default::default()
         };
         self.sections.push(Section { sh, data: section });
         self.program_headers
-            .push(get_program_header(&self.section_names, &mut sh, p_vaddr).unwrap());
+            .push(get_program_header(&self.section_names, &mut sh, &mut self.p_vaddr).unwrap());
 
         // serialize symbols and make sure that locals come first
         let mut section = vec![];
@@ -627,20 +650,39 @@ impl<'d> Writer<'d> {
                 sh_info: last_local,
                 sh_entsize: size_of::<Sym>() as u64,
                 sh_link: self.sections.len() as u32 + 1,
-                sh_offset: post_inc(file_offset, section.len() as u64),
+                sh_offset: post_inc(&mut self.file_offset, section.len() as u64),
                 ..Default::default()
             },
             data: section,
         });
 
         let mut sec = self.symbol_names.section_header(strtab_name as u32);
-        sec.sh.sh_offset = post_inc(file_offset, sec.sh.sh_size);
+        sec.sh.sh_offset = post_inc(&mut self.file_offset, sec.sh.sh_size);
         self.sections.push(sec);
         let mut sec = self.section_names.section_header(shstrtab_name as u32);
-        sec.sh.sh_offset = post_inc(file_offset, sec.sh.sh_size);
+        sec.sh.sh_offset = post_inc(&mut self.file_offset, sec.sh.sh_size);
         self.sections.push(sec);
 
         Ok(())
+    }
+
+    pub fn compute_synthesized_sections(&mut self) {
+        self.compute_got();
+        self.compute_got_plt();
+        self.compute_plt();
+
+        // only patch the first 4 sections, which are our special sections
+        for section in &mut self.sections[..4] {
+            section.sh.sh_offset = self.file_offset;
+            if let Some(ph) =
+                get_program_header(&self.section_names, &mut section.sh, &mut self.p_vaddr)
+            {
+                self.program_headers.push(ph);
+            }
+            try_add_dyn_entries(&mut self.dyn_entries, &self.section_names, &section.sh);
+            self.file_offset += section.data.len() as u64;
+        }
+        self.patch_got_plt();
     }
 
     // elf header
@@ -651,21 +693,16 @@ impl<'d> Writer<'d> {
     // program header 1
     // ...
     pub fn compute_sections(&mut self) -> Result<(), ErrorType> {
-        self.compute_got();
-        self.compute_got_plt();
-        self.compute_plt();
-
-        let mut p_vaddr = self.eh.e_entry;
-        // patch section and program headers
-        let mut file_offset = size_of::<Header>() as u64;
-        for section in &mut self.sections {
-            section.sh.sh_offset = file_offset;
-            if let Some(ph) = get_program_header(&self.section_names, &mut section.sh, &mut p_vaddr)
+        // patch section and program headers, but skip the synthesized ones
+        for section in &mut self.sections[4..] {
+            section.sh.sh_offset = self.file_offset;
+            if let Some(ph) =
+                get_program_header(&self.section_names, &mut section.sh, &mut self.p_vaddr)
             {
                 self.program_headers.push(ph);
             }
             try_add_dyn_entries(&mut self.dyn_entries, &self.section_names, &section.sh);
-            file_offset += section.data.len() as u64;
+            self.file_offset += section.data.len() as u64;
         }
 
         self.handle_special_symbols();
@@ -673,18 +710,16 @@ impl<'d> Writer<'d> {
         // we need to first patch all section headers before we
         // serialize our symbols. This is because we need to set symbol values
         // based on the section they refer to.
-        self.compute_tables(&mut file_offset, p_vaddr)?;
+        self.compute_tables()?;
 
         self.eh.e_shnum = self.sections.len() as u16;
         self.eh.e_phnum = self.program_headers.len() as u16;
         // last section is the section header string table
         self.eh.e_shstrndx = self.eh.e_shnum - 1;
-        self.eh.e_shoff = file_offset;
+        self.eh.e_shoff = self.file_offset;
         // the program header comes right after all the sections + headers
         self.eh.e_phoff =
             self.eh.e_shoff + (self.eh.e_shnum as usize * size_of::<SectionHeader>()) as u64;
-
-        self.patch_got_plt();
         Ok(())
     }
 

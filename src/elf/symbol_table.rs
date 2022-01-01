@@ -88,7 +88,15 @@ impl<'p> SymbolTable<'p> {
         syms
     }
 
-    pub fn hash_section(sh_name: u32, symbols: &[&mut Symbol]) -> super::Section {
+    /// Useful for those cases where we need quick access to a symbol with a given
+    ///st_name, and we want to know its index in the final symbol table.
+    pub fn sorted_with_indexes(&mut self) -> HashMap<u32, (usize, &mut Symbol<'p>)> {
+        let mut syms: Vec<&mut Symbol<'p>> = self.symbols.values_mut().collect();
+        syms.sort_by(|s1, s2| sort_symbols_func(&s1, &s2));
+        syms.into_iter().enumerate().map(|(i, s)| (s.st_name, (i, s))).collect()
+    }
+
+    pub fn hash_section(sh_name: u32, symbols: &[&Symbol]) -> super::Section {
         let nbuckets: u32 = symbols.len() as u32 / 2;
         let mut buckets = vec![0; nbuckets as usize];
         let mut chains = vec![0_u32; symbols.len()];
@@ -122,7 +130,7 @@ impl<'p> SymbolTable<'p> {
         }
     }
 
-    pub fn gnu_hash_section(sh_name: u32, symbols: &[&mut Symbol]) -> super::Section {
+    pub fn gnu_hash_section(sh_name: u32, symbols: &[&Symbol]) -> super::Section {
         // should be 32 for elf32, but for now we only support 64 bit anyways
         let elfclass_bits = 64;
         // TODO: figure out a good numbers here

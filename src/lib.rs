@@ -226,7 +226,9 @@ impl Linker {
         let undefined = writer.undefined_symbols();
         let undefined = self.find_undefined_symbols_in_libs(undefined, &mut writer)?;
         self.process_archives_containing(undefined, &mut writer)?;
-        writer.compute_sections().map_path_err(self.options.output.as_path())?;
+        // we need to know the address of the got and plt if we are going to handle
+        // relocations
+        writer.compute_synthesized_sections();
         for object in &elfs {
             let elf = &object.elf;
             for (section_index, rels) in &elf.shdr_relocs {
@@ -257,6 +259,7 @@ impl Linker {
                 }
             }
         }
+        writer.compute_sections().map_path_err(self.options.output.as_path())?;
         writer.write_to_disk();
         Ok(())
     }
@@ -278,12 +281,12 @@ fn get_dyn_symbol_name<'e>(elf: &Elf<'e>, index: usize) -> Result<&'e str, Strin
 fn apply_relocation(
     _elf: &Elf<'_>,
     writer: &mut crate::elf::Writer,
-    symbol: crate::elf::SymbolRef,
+    symbol_ref: crate::elf::SymbolRef,
     rel: Reloc,
     section_index: crate::elf::SectionRef,
 ) {
-    let symbol = writer.symbol(symbol);
-    let is_symbol_local = !symbol.is_local();
+    let symbol = writer.symbol(symbol_ref);
+    let is_symbol_local = symbol.is_local();
     let s: i64 = symbol.st_value.try_into().unwrap();
     let a = rel.r_addend.unwrap_or_default();
     let p: i64 = rel.r_offset.try_into().unwrap();
@@ -334,6 +337,16 @@ fn apply_relocation(
                 ref x => unreachable!("{:?}", x),
             }
         }
+        R_X86_64_GOTPCRELX => {
+            let g: i64 = symbol.got_offset().unwrap().try_into().unwrap();
+            let value: i32 = (g + got + a - p).try_into().unwrap();
+            let buf = writer.section_offset(section_index, rel.r_offset as usize);
+            buf[..].as_mut().write_i32::<LittleEndian>(value).unwrap();
+            writer.add_dyn_relocation(
+                Rela { r_offset: (got + g) as u64, r_info: R_X86_64_GLOB_DAT as u64, r_addend: 0 },
+                symbol_ref,
+            );
+        }
         R_X86_64_REX_GOTPCRELX => {
             if is_symbol_local {
                 let buf = writer.section_offset(section_index, rel.r_offset as usize - 3);
@@ -358,12 +371,16 @@ fn apply_relocation(
                 };
                 buf[..3].as_mut().write_all(&instr).unwrap();
                 let value: i32 = (s + a - p).try_into().unwrap();
-                buf[3..].as_mut().write_i32::<LittleEndian>(value).unwrap()
+                buf[3..].as_mut().write_i32::<LittleEndian>(value).unwrap();
             } else {
                 let g: i64 = symbol.got_offset().unwrap().try_into().unwrap();
                 let value: i32 = (g + got + a - p).try_into().unwrap();
                 let buf = writer.section_offset(section_index, rel.r_offset as usize);
-                buf[3..].as_mut().write_i32::<LittleEndian>(value).unwrap()
+                buf[3..].as_mut().write_i32::<LittleEndian>(value).unwrap();
+                writer.add_dyn_relocation(
+                    Rela { r_offset: (got + g) as u64, r_info: R_X86_64_GLOB_DAT as u64, r_addend: 0 },
+                    symbol_ref,
+                );
             };
         }
         R_X86_64_TLSGD => {
@@ -377,11 +394,10 @@ fn apply_relocation(
                 (got_offset + size_of::<u64>(), R_X86_64_DTPMOD64),
             ] {
                 // XXX:
-                writer.add_dyn_relocation(Rela {
-                    r_offset: got_offset as u64,
-                    r_info: (rel.r_sym << 8) as u64 + ty as u64,
-                    r_addend: 0,
-                });
+                writer.add_dyn_relocation(
+                    Rela { r_offset: (got + got_offset as i64) as u64, r_info: ty as u64, r_addend: 0 },
+                    symbol_ref,
+                );
             }
         }
         R_X86_64_GOTTPOFF => {
@@ -391,11 +407,14 @@ fn apply_relocation(
             let value = got_offset as i64 + got + a - p;
             section_offset.write_i32::<LittleEndian>(value.try_into().unwrap()).unwrap();
             // XXX:
-            writer.add_dyn_relocation(Rela {
-                r_offset: (got_offset as i64 + got) as u64,
-                r_info: (rel.r_sym << 8) as u64 + R_X86_64_TPOFF64 as u64,
-                r_addend: 0,
-            });
+            writer.add_dyn_relocation(
+                Rela {
+                    r_offset: (got + got_offset as i64) as u64,
+                    r_info: R_X86_64_TPOFF64 as u64,
+                    r_addend: 0,
+                },
+                symbol_ref,
+            );
         }
         R_X86_64_TPOFF32 => {
             let mut section_offset = writer.section_offset(section_index, rel.r_offset as usize);
