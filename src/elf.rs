@@ -152,12 +152,12 @@ impl<'d> Writer<'d> {
             e_type: ET_EXEC,
             e_machine: EM_X86_64,
             e_version: EV_CURRENT as u32,
-            e_entry: 0x201030,
             e_flags: 0,
             e_ehsize: size_of::<Header>() as u16,
             e_phentsize: size_of::<ProgramHeader>() as u16,
             e_shentsize: size_of::<SectionHeader>() as u16,
             // patched in `Writer::write`
+            e_entry: 0,
             e_phnum: 0,
             e_shnum: 0,
             e_phoff: 0,
@@ -182,7 +182,7 @@ impl<'d> Writer<'d> {
             got_plt: Default::default(),
             dyn_entries: vec![],
             program_headers: vec![],
-            p_vaddr: eh.e_entry,
+            p_vaddr: 0x40000,
             file_offset: size_of::<Header>() as u64,
             got_section: 0,
             plt_section: 0,
@@ -716,6 +716,9 @@ impl<'d> Writer<'d> {
             }
             try_add_dyn_entries(&mut self.dyn_entries, &self.section_names, &section.sh);
             self.file_offset += section.data.len() as u64;
+            if self.section_names.name(section.sh.sh_name as usize).unwrap().starts_with(".text") {
+                self.eh.e_entry = section.sh.sh_addr;
+            }
         }
 
         self.handle_special_symbols();
