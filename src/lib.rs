@@ -120,7 +120,7 @@ fn process_elf_object<'e, 'o>(
 
 pub struct Linker {
     pub options: crate::elf::Options,
-    pub objects: HashSet<PathBuf>,
+    pub objects: Vec<PathBuf>,
     pub archives: HashSet<PathBuf>,
 }
 

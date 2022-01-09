@@ -35,11 +35,11 @@ OPTIONS:
 #[derive(Debug, Default)]
 struct AppArgs {
     opts: Options,
-    objects: HashSet<PathBuf>,
+    objects: Vec<PathBuf>,
     archives: HashSet<PathBuf>,
     search_paths: HashSet<PathBuf>,
     scripts: Vec<PathBuf>,
-    inputs: HashMap<PathBuf, bool>,
+    inputs: Vec<(PathBuf, bool)>,
     help: bool,
     as_needed: bool,
 }
@@ -159,7 +159,7 @@ fn handle_linker_args(
             "-l" => {
                 let path =
                     args.next().ok_or_else(|| "Missing argument <PATH> for '-l'.".to_string())?;
-                app.inputs.insert(path.into(), app.as_needed);
+                app.inputs.push((path.into(), app.as_needed));
                 continue;
             }
             "--as-needed" => {
@@ -180,18 +180,18 @@ fn handle_linker_args(
         if let Some(arg) = arg.strip_prefix("-L") {
             app.search_paths.insert(PathBuf::from(arg).canonicalize().unwrap());
         } else if let Some(lib) = arg.strip_prefix("-l") {
-            app.inputs.insert(lib.into(), app.as_needed);
+            app.inputs.push((lib.into(), app.as_needed));
         } else if let Some(arg) = arg.strip_prefix("--hash-style=") {
             app.opts.hash_style = HashStyle::from_str(arg)?;
         } else {
-            app.inputs.insert(arg.into(), app.as_needed);
+            app.inputs.push((arg.into(), app.as_needed));
         }
     }
     Ok(())
 }
 
 fn search_for_inputs(args: &mut AppArgs) -> Result<(), PathBuf> {
-    for (lib, as_needed) in args.inputs.drain() {
+    for (lib, as_needed) in args.inputs.drain(..) {
         let mut found = None;
         if lib.exists() && lib.is_file() {
             found = Some(lib.clone());
@@ -216,7 +216,7 @@ fn search_for_inputs(args: &mut AppArgs) -> Result<(), PathBuf> {
             let file_type = file_type(&lib).unwrap();
             match file_type {
                 FileType::ElfObject => {
-                    args.objects.insert(lib.canonicalize().unwrap());
+                    args.objects.push(lib.canonicalize().unwrap());
                 }
                 FileType::Archive => {
                     args.archives.insert(lib.canonicalize().unwrap());
