@@ -47,6 +47,15 @@ impl Section {
         &mut self.chunks[..]
     }
 
+    pub fn set_address(&mut self, sh_addr: u64) {
+        self.sh_addr = sh_addr;
+        let mut base_addr = self.sh_addr;
+        for chunk in &mut self.chunks {
+            chunk.set_address(base_addr);
+            base_addr += chunk.len() as u64;
+        }
+    }
+
     pub fn patch_symbol_values(&self, sh_index: u16, table: &mut crate::elf::SymbolTable) {
         let mut base_addr = self.sh_addr;
         for chunk in &self.chunks {

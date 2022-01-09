@@ -7,6 +7,7 @@ use crate::elf::{SymbolRef, SymbolTable};
 
 /// A part of a section.
 pub struct Chunk {
+    address: Option<u64>,
     data: Vec<u8>,
     symbols: Vec<SymbolRef>,
     relocations: Vec<(Rela, SymbolRef)>,
@@ -14,7 +15,7 @@ pub struct Chunk {
 
 impl Chunk {
     pub fn new(data: Vec<u8>) -> Self {
-        Self { data, symbols: vec![], relocations: vec![] }
+        Self { address: None, data, symbols: vec![], relocations: vec![] }
     }
 
     pub fn add_symbol(&mut self, sym_ref: SymbolRef) {
@@ -29,9 +30,14 @@ impl Chunk {
         &self.symbols[..]
     }
 
+    pub fn relocations(&self) -> &[(Rela, SymbolRef)] {
+        &self.relocations
+    }
+
     pub fn apply_relocations(&mut self, got_address: u64, plt_address: u64, table: &SymbolTable) {
         for (rela, symbol_ref) in &self.relocations {
             apply_relocation(
+                *self.address.as_ref().unwrap(),
                 &mut self.data[..],
                 *rela,
                 table.get(*symbol_ref).unwrap(),
@@ -39,6 +45,14 @@ impl Chunk {
                 plt_address,
             );
         }
+    }
+
+    pub fn set_address(&mut self, addr: u64) {
+        self.address = Some(addr);
+    }
+
+    pub fn address(&self) -> Option<u64> {
+        self.address
     }
 }
 
@@ -63,6 +77,7 @@ impl std::ops::DerefMut for Chunk {
 }
 
 fn apply_relocation(
+    address: u64,
     data: &mut [u8],
     rel: Rela,
     symbol: &crate::elf::Symbol<'_>,
@@ -72,7 +87,7 @@ fn apply_relocation(
     let is_symbol_local = symbol.is_local();
     let s: i64 = symbol.st_value.try_into().unwrap();
     let a = rel.r_addend;
-    let p: i64 = rel.r_offset.try_into().unwrap();
+    let p: i64 = (address + rel.r_offset).try_into().unwrap();
     let _z = symbol.st_size;
     let got: i64 = got_address.try_into().unwrap();
     let l: i64 = plt_address.try_into().unwrap();

@@ -713,14 +713,14 @@ const fn round_to(val: u64, multiple: u64) -> u64 {
 
 fn get_program_header(
     names: &StringTable,
-    sh: &mut SectionHeader,
+    sh: &mut Section,
     p_vaddr: &mut u64,
 ) -> Option<ProgramHeader> {
     if sh.sh_size != 0 && sh.sh_flags as u32 & SHF_ALLOC == SHF_ALLOC {
         let write = if sh.sh_flags as u32 & SHF_WRITE == SHF_WRITE { PF_W } else { 0 };
         let exec = if sh.sh_flags as u32 & SHF_EXECINSTR == SHF_EXECINSTR { PF_X } else { 0 };
         *p_vaddr = round_to(*p_vaddr, sh.sh_addralign);
-        sh.sh_addr = *p_vaddr;
+        sh.set_address(*p_vaddr);
         Some(ProgramHeader {
             p_type: p_type(names, sh),
             p_flags: PF_R | write | exec,
