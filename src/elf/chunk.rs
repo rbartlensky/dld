@@ -163,8 +163,7 @@ fn apply_relocation(
             } else {
                 let g: i64 = symbol.got_offset().unwrap().try_into().unwrap();
                 let value: i32 = (g + got + a - p).try_into().unwrap();
-                let buf = &mut data[offset..];
-                buf[3..].as_mut().write_i32::<LittleEndian>(value).unwrap();
+                (&mut data[offset..]).write_i32::<LittleEndian>(value).unwrap();
             };
         }
         R_X86_64_TLSGD => {
