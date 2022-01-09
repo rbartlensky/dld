@@ -339,7 +339,9 @@ impl<'d> Writer<'d> {
             .add_symbol(elf_sym, hash, gnu_hash, reference)
             .map_err(|e| ErrorType::Other(format!("{} {}", &name as &str, e)))?;
         if let Some(chunk) = chunk {
-            r.map(|sym| chunk.add_symbol(sym));
+            if elf_sym.st_shndx != SHN_ABS as u16 {
+                r.map(|sym| chunk.add_symbol(sym));
+            }
         }
         Ok(r)
     }
