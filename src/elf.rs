@@ -636,7 +636,7 @@ impl<'d> Writer<'d> {
 
     fn handle_relocations(&mut self) {
         let got_address = self.got_address();
-        let plt_address = self.got_address();
+        let plt_address = self.plt_address();
         // skip over null section
         for (i, section) in &mut self.sections.iter_mut().enumerate().skip(1) {
             section.patch_symbol_values(i as u16, &mut self.symbols);
