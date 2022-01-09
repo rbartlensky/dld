@@ -1,8 +1,10 @@
-use crate::elf::Symbol;
+use crate::elf::{Chunk, Symbol};
 use crate::serialize::Serialize;
 
 use goblin::elf64::{
-    section_header::{SectionHeader, SHF_ALLOC, SHN_UNDEF, SHT_GNU_HASH, SHT_HASH},
+    section_header::{
+        SectionHeader, SHF_ALLOC, SHN_UNDEF, SHT_DYNSYM, SHT_GNU_HASH, SHT_HASH, SHT_SYMTAB,
+    },
     sym::Sym,
 };
 use std::{
@@ -26,12 +28,41 @@ pub enum Error {
     AlreadyDefined(PathBuf),
 }
 
-#[derive(Default)]
 pub struct SymbolTable<'p> {
     symbols: HashMap<u32, Symbol<'p>>,
+    num_locals: usize,
+}
+
+impl Default for SymbolTable<'_> {
+    fn default() -> Self {
+        let mut table = Self { symbols: Default::default(), num_locals: 0 };
+        table
+            .add_symbol(
+                Sym { st_shndx: SHN_UNDEF as u16, ..Default::default() },
+                0,
+                0,
+                Path::new(""),
+            )
+            .unwrap();
+        table
+    }
 }
 
 impl<'p> SymbolTable<'p> {
+    pub fn new(sh_name: u32, is_dynamic: bool) -> (Self, SectionHeader) {
+        (
+            Default::default(),
+            SectionHeader {
+                sh_name,
+                sh_type: if is_dynamic { SHT_DYNSYM } else { SHT_SYMTAB },
+                sh_entsize: size_of::<Sym>() as u64,
+                sh_flags: SHF_ALLOC as u64,
+                sh_addralign: std::mem::align_of::<u64>() as u64,
+                ..Default::default()
+            },
+        )
+    }
+
     pub fn add_symbol(
         &mut self,
         elf_sym: Sym,
@@ -68,6 +99,9 @@ impl<'p> SymbolTable<'p> {
                 }
             }
             Entry::Vacant(v) => {
+                if new_sym.is_local() {
+                    self.num_locals += 1;
+                }
                 v.insert(new_sym);
             }
         };
@@ -82,7 +116,13 @@ impl<'p> SymbolTable<'p> {
         self.symbols.get_mut(&s.st_name)
     }
 
-    pub fn sorted(&mut self) -> Vec<&mut Symbol<'p>> {
+    pub fn sorted(&self) -> Vec<&Symbol<'p>> {
+        let mut syms: Vec<&Symbol<'p>> = self.symbols.values().collect();
+        syms.sort_by(|s1, s2| sort_symbols_func(&s1, &s2));
+        syms
+    }
+
+    pub fn sorted_mut(&mut self) -> Vec<&mut Symbol<'p>> {
         let mut syms: Vec<&mut Symbol<'p>> = self.symbols.values_mut().collect();
         syms.sort_by(|s1, s2| sort_symbols_func(&s1, &s2));
         syms
@@ -96,8 +136,24 @@ impl<'p> SymbolTable<'p> {
         syms.into_iter().enumerate().map(|(i, s)| (s.st_name, (i, s))).collect()
     }
 
+    pub fn total_len(&self) -> usize {
+        self.symbols.len() * size_of::<Sym>()
+    }
+
+    pub fn chunk(&self) -> Chunk {
+        let mut data = Vec::with_capacity(self.total_len());
+        for sym in self.sorted() {
+            sym.serialize(&mut data);
+        }
+        data.into()
+    }
+
+    pub fn num_locals(&self) -> usize {
+        self.num_locals
+    }
+
     pub fn hash_section(sh_name: u32, symbols: &[&Symbol]) -> super::Section {
-        let nbuckets: u32 = symbols.len() as u32 / 2;
+        let nbuckets: u32 = symbols.len() as u32 / 2 + 1;
         let mut buckets = vec![0; nbuckets as usize];
         let mut chains = vec![0_u32; symbols.len()];
         for (symbol_index, symbol) in symbols.iter().enumerate() {
@@ -116,8 +172,8 @@ impl<'p> SymbolTable<'p> {
         }
         let mut data = Vec::with_capacity(nbuckets as usize + chains.len() + 2);
         HashTable::new(buckets, chains).serialize(&mut data);
-        super::Section {
-            sh: SectionHeader {
+        super::Section::with_chunk(
+            SectionHeader {
                 sh_name,
                 sh_type: SHT_HASH,
                 sh_size: data.len() as u64,
@@ -127,7 +183,7 @@ impl<'p> SymbolTable<'p> {
                 ..Default::default()
             },
             data,
-        }
+        )
     }
 
     pub fn gnu_hash_section(sh_name: u32, symbols: &[&Symbol]) -> super::Section {
@@ -187,8 +243,8 @@ impl<'p> SymbolTable<'p> {
         };
         let mut data = Vec::with_capacity(ght.size());
         ght.serialize(&mut data);
-        super::Section {
-            sh: SectionHeader {
+        super::Section::with_chunk(
+            SectionHeader {
                 sh_name,
                 sh_type: SHT_GNU_HASH,
                 sh_size: data.len() as u64,
@@ -198,7 +254,7 @@ impl<'p> SymbolTable<'p> {
                 ..Default::default()
             },
             data,
-        }
+        )
     }
 }
 

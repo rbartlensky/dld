@@ -17,11 +17,12 @@ pub struct Symbol<'r> {
     in_got: Option<usize>,
     in_plt: Option<usize>,
     in_got_plt: Option<usize>,
+    dynamic: bool,
 }
 
 impl<'r> Symbol<'r> {
     pub fn new(sym: Sym, hash: u32, gnu_hash: u32, reference: &'r Path) -> Self {
-        Self { sym, reference, hash, gnu_hash, in_got: None, in_plt: None, in_got_plt: None }
+        Self { sym, reference, hash, gnu_hash, in_got: None, in_plt: None, in_got_plt: None, dynamic: false }
     }
 
     pub const fn st_bind(&self) -> u8 {
@@ -94,6 +95,14 @@ impl<'r> Symbol<'r> {
 
     pub fn gnu_hash(&self) -> u32 {
         self.gnu_hash
+    }
+
+    pub fn is_dynamic(&self) -> bool {
+        self.dynamic
+    }
+
+    pub fn set_dynamic(&mut self, dynamic: bool) {
+        self.dynamic = dynamic;
     }
 }
 

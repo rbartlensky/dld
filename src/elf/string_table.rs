@@ -1,6 +1,6 @@
 use goblin::elf64::section_header::{SectionHeader, SHT_STRTAB};
 
-use crate::name::Name;
+use crate::{name::Name, serialize::Serialize};
 
 use std::collections::HashMap;
 
@@ -11,14 +11,40 @@ pub struct Entry {
     pub new: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StringTable {
     // name -> (index, offset)
     names: HashMap<Name, (usize, usize)>,
     total_len: usize,
 }
 
+impl Default for StringTable {
+    fn default() -> Self {
+        let mut table = Self { names: Default::default(), total_len: 0 };
+        table.get_or_create("");
+        table
+    }
+}
+
 impl StringTable {
+    pub fn with_name(name: impl Into<Name>) -> (Self, SectionHeader) {
+        let mut table = Self::default();
+        let entry = table.get_or_create(name);
+        let sh = SectionHeader {
+            sh_name: entry.offset as u32,
+            sh_type: SHT_STRTAB,
+            sh_addralign: 1,
+            ..Default::default()
+        };
+        (table, sh)
+    }
+
+    pub fn new(sh_name: u32) -> (Self, SectionHeader) {
+        let sh =
+            SectionHeader { sh_name, sh_type: SHT_STRTAB, sh_addralign: 1, ..Default::default() };
+        (Self::default(), sh)
+    }
+
     pub fn get_or_create(&mut self, name: impl Into<Name>) -> Entry {
         let mut new = false;
         let mut add_len = 0;
@@ -59,24 +85,12 @@ impl StringTable {
         names
     }
 
-    pub fn section_header(&self, sh_name: u32) -> crate::elf::Section {
-        use crate::serialize::Serialize;
-
-        let mut section = vec![];
+    pub fn chunk(&self) -> crate::elf::Chunk {
+        let mut data = Vec::with_capacity(self.total_len);
         let names = self.sorted_names();
         for (name, _) in names {
-            name.serialize(&mut section);
+            name.serialize(&mut data);
         }
-        // add our string table section header
-        crate::elf::Section {
-            sh: SectionHeader {
-                sh_name,
-                sh_type: SHT_STRTAB,
-                sh_size: self.total_len() as u64,
-                sh_addralign: 1,
-                ..Default::default()
-            },
-            data: section,
-        }
+        data.into()
     }
 }
