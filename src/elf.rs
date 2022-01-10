@@ -662,6 +662,9 @@ impl<'d> Writer<'d> {
 
         self.compute_tables();
 
+        if let Some(entry) = self.symbol_names.get("_start") {
+            self.eh.e_entry = self.symbols[&(entry.offset as u32)].st_value;
+        }
         self.eh.e_shnum = self.sections.len() as u16;
         self.eh.e_phnum = self.program_headers.len() as u16;
         self.eh.e_shstrndx = self.shstr_section as u16;
