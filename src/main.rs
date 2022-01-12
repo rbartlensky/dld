@@ -1,7 +1,7 @@
 use dld::elf::{BuildId, Emulation, HashStyle, Options};
 use goblin::elf32::header::ET_DYN;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     io::Read,
     path::PathBuf,
     str::FromStr,

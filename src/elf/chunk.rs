@@ -95,7 +95,7 @@ fn apply_relocation(
         R_X86_64_NONE => {}
         R_X86_64_64 => (&mut data[offset..]).write_i64::<LittleEndian>(s + a).unwrap(),
         R_X86_64_32 => {
-            (&mut data[offset..]).write_i32::<LittleEndian>((s + a).try_into().unwrap()).unwrap()
+            (&mut data[offset..]).write_i32::<LittleEndian>((s + a).try_into().unwrap()).unwrap();
         }
         R_X86_64_32S => {
             // TODO warn about truncation

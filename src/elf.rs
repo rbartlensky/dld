@@ -637,9 +637,11 @@ impl<'d> Writer<'d> {
     fn handle_relocations(&mut self) {
         let got_address = self.got_address();
         let plt_address = self.plt_address();
-        // skip over null section
+        // first patch symbol values
         for (i, section) in &mut self.sections.iter_mut().enumerate().skip(1) {
             section.patch_symbol_values(i as u16, &mut self.symbols);
+        }
+        for section in &mut self.sections.iter_mut().skip(1) {
             for chunk in section.chunks_mut() {
                 chunk.apply_relocations(got_address, plt_address, &self.symbols);
             }
@@ -719,7 +721,7 @@ fn get_program_header(
     sh: &mut Section,
     p_vaddr: &mut u64,
 ) -> Option<ProgramHeader> {
-    if sh.sh_size != 0 && sh.sh_flags as u32 & SHF_ALLOC == SHF_ALLOC {
+    if sh.sh_flags as u32 & SHF_ALLOC == SHF_ALLOC {
         let write = if sh.sh_flags as u32 & SHF_WRITE == SHF_WRITE { PF_W } else { 0 };
         let exec = if sh.sh_flags as u32 & SHF_EXECINSTR == SHF_EXECINSTR { PF_X } else { 0 };
         *p_vaddr = round_to(*p_vaddr, sh.sh_addralign);
