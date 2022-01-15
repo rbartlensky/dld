@@ -1,11 +1,6 @@
 use dld::elf::{BuildId, Emulation, HashStyle, Options};
 use goblin::elf32::header::ET_DYN;
-use std::{
-    collections::HashSet,
-    io::Read,
-    path::PathBuf,
-    str::FromStr,
-};
+use std::{collections::HashSet, io::Read, path::PathBuf, str::FromStr};
 
 mod linker_script;
 

@@ -1,3 +1,5 @@
+use crate::elf::SymbolRef;
+
 use std::{
     hash::{Hash, Hasher},
     path::Path,
@@ -17,12 +19,21 @@ pub struct Symbol<'r> {
     in_got: Option<usize>,
     in_plt: Option<usize>,
     in_got_plt: Option<usize>,
-    dynamic: bool,
+    dynamic: Option<SymbolRef>,
 }
 
 impl<'r> Symbol<'r> {
     pub fn new(sym: Sym, hash: u32, gnu_hash: u32, reference: &'r Path) -> Self {
-        Self { sym, reference, hash, gnu_hash, in_got: None, in_plt: None, in_got_plt: None, dynamic: false }
+        Self {
+            sym,
+            reference,
+            hash,
+            gnu_hash,
+            in_got: None,
+            in_plt: None,
+            in_got_plt: None,
+            dynamic: None,
+        }
     }
 
     pub const fn st_bind(&self) -> u8 {
@@ -97,12 +108,12 @@ impl<'r> Symbol<'r> {
         self.gnu_hash
     }
 
-    pub fn is_dynamic(&self) -> bool {
+    pub fn dynamic(&self) -> Option<SymbolRef> {
         self.dynamic
     }
 
-    pub fn set_dynamic(&mut self, dynamic: bool) {
-        self.dynamic = dynamic;
+    pub fn set_dynamic(&mut self, dynamic: SymbolRef) {
+        self.dynamic = Some(dynamic);
     }
 }
 

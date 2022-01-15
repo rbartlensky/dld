@@ -108,7 +108,7 @@ fn apply_relocation(
             let g: i64 = symbol.got_offset().unwrap().try_into().unwrap();
             (&mut data[offset..]).write_i32::<LittleEndian>((g + a).try_into().unwrap()).unwrap()
         }
-        R_X86_64_GOTPCRELX if !symbol.is_dynamic() => {
+        R_X86_64_GOTPCRELX if symbol.dynamic().is_none() => {
             // -2 because the offset points to where we need to patch, but we want to
             // match the other two bytes to tell which instruction we're patching
             let buf = &mut data[offset - 2..];
@@ -135,7 +135,7 @@ fn apply_relocation(
             (&mut data[offset..]).write_i32::<LittleEndian>(value).unwrap();
         }
         R_X86_64_REX_GOTPCRELX => {
-            if !symbol.is_dynamic() {
+            if symbol.dynamic().is_none() {
                 let buf = &mut data[offset - 3..];
                 let instr = match buf[..3] {
                     [0x48, 0x8b, 0x05] => [0x48, 0x8d, 0x05], // mov 0x0(%rip),%rax -> lea 0x0(%rip),%rax

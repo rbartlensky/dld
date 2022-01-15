@@ -6,7 +6,7 @@ use goblin::elf64::{
     section_header::{
         SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, SHN_UNDEF, SHT_DYNAMIC,
         SHT_DYNSYM, SHT_FINI_ARRAY, SHT_GNU_HASH, SHT_HASH, SHT_INIT_ARRAY, SHT_NOBITS,
-        SHT_PROGBITS, SHT_STRTAB,
+        SHT_PROGBITS, SHT_RELA, SHT_STRTAB,
     },
     sym::Sym,
 };
@@ -120,7 +120,7 @@ pub struct Writer<'d> {
     symbols: SymbolTable<'d>,
     dyn_symbol_names: StringTable,
     dyn_symbols: SymbolTable<'d>,
-    dyn_rels: Vec<(Rela, SymbolRef)>,
+    dyn_rels: Vec<Rela>,
     sections: Vec<Section>,
     got_len: usize,
     plt: HashMap<SymbolRef, usize>,
@@ -138,6 +138,7 @@ pub struct Writer<'d> {
     plt_section: usize,
     got_plt_section: usize,
     dynamic_section: usize,
+    dyn_rel_section: usize,
 }
 
 impl<'d> Writer<'d> {
@@ -220,6 +221,15 @@ impl<'d> Writer<'d> {
             ..Default::default()
         };
 
+        let dyn_rel_sh = SectionHeader {
+            sh_name: section_names.get_or_create(".rela.dyn").offset as u32,
+            sh_type: SHT_RELA,
+            sh_entsize: size_of::<Rela>() as u64,
+            sh_flags: SHF_ALLOC as u64,
+            sh_addralign: align_of::<u64>() as u64,
+            ..Default::default()
+        };
+
         Ok(Self {
             out,
             hash_style: options.hash_style,
@@ -242,6 +252,7 @@ impl<'d> Writer<'d> {
                 symbols_sh.into(),
                 dyn_symbols_sh.into(),
                 dynamic_sh.into(),
+                dyn_rel_sh.into(),
             ],
             // first entry reserved
             got_len: 1,
@@ -260,6 +271,7 @@ impl<'d> Writer<'d> {
             plt_section: 6,
             got_plt_section: 7,
             dynamic_section: 10,
+            dyn_rel_section: 11,
         })
     }
 
@@ -315,10 +327,6 @@ impl<'d> Writer<'d> {
 
     fn chunk(&mut self, section_ref: SectionRef) -> &mut Chunk {
         self.sections[section_ref.index].chunk_mut(section_ref.chunk)
-    }
-
-    pub fn add_dyn_relocation(&mut self, r: Rela, sym: SymbolRef) {
-        self.dyn_rels.push((r, sym));
     }
 
     fn add_symbol_inner<'s>(
@@ -391,12 +399,12 @@ impl<'d> Writer<'d> {
             &mut self.dyn_symbol_names,
             &mut self.dyn_symbols,
         );
-        if let Ok(Some(_)) = r {
+        if let Ok(Some(dyn_ref)) = r {
             if let Some(entry) = self.symbol_names.get(name.to_string()) {
                 self.symbols
                     .get_mut(SymbolRef { st_name: entry.offset as u32 })
                     .unwrap()
-                    .set_dynamic(true);
+                    .set_dynamic(dyn_ref);
             }
         }
         r
@@ -415,7 +423,7 @@ impl<'d> Writer<'d> {
         for (st_name, sym) in self.symbols.iter() {
             if sym.st_shndx as u32 == SHN_UNDEF
                 && (sym.is_global() || sym.is_weak())
-                && !sym.is_dynamic()
+                && sym.dynamic().is_none()
             {
                 undefined.push(SymbolRef { st_name: *st_name });
             }
@@ -583,13 +591,22 @@ impl<'d> Writer<'d> {
         }
 
         // populate dynamic section
-        {
-            let section = &mut self.sections[self.dynamic_section];
-            let mut data = Vec::with_capacity(section.sh_size as usize);
-            self.dyn_entries.serialize(&mut data);
-            section.add_chunk(data.into());
-            section.sh_link = self.dyn_sym_str_section as u32;
+        let section = &mut self.sections[self.dynamic_section];
+        let mut data = Vec::with_capacity(section.sh_size as usize);
+        self.dyn_entries.serialize(&mut data);
+        section.add_chunk(data.into());
+        section.sh_link = self.dyn_sym_str_section as u32;
+
+        // populate dyn.rel section
+        let mut data = Vec::with_capacity(self.sections[self.dyn_rel_section].sh_size as usize);
+        let got_addr = self.got_address();
+        for dyn_rel in &mut self.dyn_rels {
+            dyn_rel.r_offset += got_addr;
+            dyn_rel.serialize(&mut data);
         }
+        let section = &mut self.sections[self.dyn_rel_section];
+        section.add_chunk(data.into());
+        section.sh_link = self.dyn_sym_section as u32;
     }
 
     pub fn assign_section_addresses(&mut self) {
@@ -616,6 +633,25 @@ impl<'d> Writer<'d> {
         self.sections[self.shstr_section].sh_size = self.section_names.total_len() as u64;
         self.sections[self.sym_str_section].sh_size = self.symbol_names.total_len() as u64;
         self.sections[self.dyn_sym_str_section].sh_size = self.dyn_symbol_names.total_len() as u64;
+
+        for (sym, dyn_sym) in self.symbols.values().filter_map(|s| s.dynamic().map(|d| (s, d))) {
+            if let Some(offset) = sym.got_offset() {
+                // XXX: this should be more efficient
+                let index = sorted
+                    .iter()
+                    .enumerate()
+                    .find(|(_, s)| s.st_name == dyn_sym.st_name)
+                    .map(|(i, _)| i)
+                    .unwrap();
+                self.dyn_rels.push(Rela {
+                    r_offset: offset as u64,
+                    r_info: ((index << 32) + R_X86_64_GLOB_DAT as usize) as u64,
+                    r_addend: 0,
+                });
+            }
+        }
+        self.sections[self.dyn_rel_section].sh_size =
+            (self.dyn_rels.len() * size_of::<Rela>()) as u64;
 
         // calculate how many dyntags we have, so that we know how big our dynamic section is
         for section in &mut self.sections {
