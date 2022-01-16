@@ -5,8 +5,8 @@ use goblin::elf64::{
     reloc::{Rela, *},
     section_header::{
         SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, SHN_UNDEF, SHT_DYNAMIC,
-        SHT_DYNSYM, SHT_FINI_ARRAY, SHT_GNU_HASH, SHT_HASH, SHT_INIT_ARRAY, SHT_NOBITS,
-        SHT_PROGBITS, SHT_RELA, SHT_STRTAB,
+        SHT_DYNSYM, SHT_FINI_ARRAY, SHT_GNU_HASH, SHT_HASH, SHT_INIT_ARRAY, SHT_PROGBITS, SHT_RELA,
+        SHT_STRTAB,
     },
     sym::Sym,
 };
@@ -171,8 +171,9 @@ impl<'d> Writer<'d> {
         let (mut section_names, section_names_sh) = StringTable::with_name(".shstrtab");
         let (symbol_names, symbol_names_sh) =
             StringTable::new(section_names.get_or_create(".strtab").offset as u32);
-        let (mut dyn_symbol_names, dyn_symbol_names_sh) =
+        let (mut dyn_symbol_names, mut dyn_symbol_names_sh) =
             StringTable::new(section_names.get_or_create(".dynstr").offset as u32);
+        dyn_symbol_names_sh.sh_flags = SHF_ALLOC as u64;
         let loader = options
             .dynamic_linker
             .to_str()
@@ -638,6 +639,14 @@ impl<'d> Writer<'d> {
                 self.dyn_rel_section = i;
             }
         }
+        for section in &mut self.sections {
+            let sh_name = section.sh_name as usize;
+            if sh_name == self.section_names.sh_name(".hash")
+                || sh_name == self.section_names.sh_name(".gnu.hash")
+            {
+                section.sh_link = self.dyn_sym_section as u32;
+            }
+        }
     }
 
     fn assign_section_addresses(&mut self) {
@@ -650,14 +659,12 @@ impl<'d> Writer<'d> {
         let sorted = self.dyn_symbols.sorted();
         if self.hash_style == HashStyle::Sysv || self.hash_style == HashStyle::Both {
             let hash_name = self.section_names.get_or_create(".hash").offset;
-            let mut sec = SymbolTable::hash_section(hash_name as u32, &sorted[..]);
-            sec.sh_link = self.dyn_sym_section as u32;
+            let sec = SymbolTable::hash_section(hash_name as u32, &sorted[..]);
             self.sections.push(sec);
         }
         if self.hash_style == HashStyle::Gnu || self.hash_style == HashStyle::Both {
             let hash_name = self.section_names.get_or_create(".gnu.hash").offset;
-            let mut sec = SymbolTable::gnu_hash_section(hash_name as u32, &sorted[..]);
-            sec.sh_link = self.dyn_sym_section as u32;
+            let sec = SymbolTable::gnu_hash_section(hash_name as u32, &sorted[..]);
             self.sections.push(sec);
         }
 
@@ -751,6 +758,18 @@ impl<'d> Writer<'d> {
         log::trace!("0x{:x}: ---- elf header ----\n{:#?}", offset, self.eh);
         offset += self.eh.serialize(&mut self.out);
         for (i, section) in self.sections.iter().enumerate() {
+            // add the necessary padding between aligned sections
+            if offset < section.sh_offset as usize {
+                log::error!("Extra stuff added: {:x}", section.sh_offset as usize - offset);
+                self.out
+                    .write_all(
+                        &std::iter::repeat(0)
+                            .take(section.sh_offset as usize - offset)
+                            .collect::<Vec<u8>>(),
+                    )
+                    .unwrap();
+                offset = section.sh_offset as usize;
+            }
             log::trace!(
                 "0x{:x}: ---- section {} {:?} ----",
                 offset,
@@ -780,8 +799,30 @@ impl<'d> Writer<'d> {
     fn generate_program_headers(&mut self) {
         let mut flags = 0;
         let mut program_header = None;
-        for sh in &mut self.sections {
-            sh.sh_offset = post_inc(&mut self.file_offset, sh.size_on_disk());
+        for sh in self.sections.iter_mut().skip(1) {
+            if sh.sh_flags != flags {
+                // push old program header
+                if let Some(ph) = program_header.take() {
+                    self.program_headers.push(ph);
+                }
+
+                // this function deals with sh_offset for us. if we don't
+                // get a header, then we have to deal with it
+                program_header =
+                    get_load_program_header(sh, &mut self.file_offset, &mut self.p_vaddr);
+                if program_header.is_none() {
+                    sh.sh_offset = post_inc(&mut self.file_offset, sh.size_on_disk());
+                }
+                flags = sh.sh_flags;
+            } else {
+                sh.sh_offset = post_inc(&mut self.file_offset, sh.size_on_disk());
+                if let Some(ph) = program_header.as_mut() {
+                    ph.p_filesz += sh.size_on_disk();
+                    ph.p_memsz += sh.sh_size;
+                    sh.set_address(self.p_vaddr);
+                    self.p_vaddr += sh.sh_size;
+                }
+            }
             if let Some(p_type) = p_type(&self.section_names, &sh) {
                 // for .interp or .dynamic we have some extra program headers we want to generate
                 self.program_headers.insert(
@@ -793,24 +834,10 @@ impl<'d> Writer<'d> {
                         p_offset: sh.sh_offset,
                         p_vaddr: self.p_vaddr,
                         p_paddr: self.p_vaddr,
-                        p_filesz: if sh.sh_type == SHT_NOBITS { 0 } else { sh.sh_size },
+                        p_filesz: sh.size_on_disk(),
                         p_memsz: sh.sh_size,
                     },
                 )
-            }
-            if sh.sh_flags != flags {
-                program_header = get_load_program_header(sh, &mut self.p_vaddr);
-                if let Some(ph) = program_header {
-                    self.program_headers.push(ph);
-                }
-                flags = sh.sh_flags;
-            } else {
-                if let Some(mut ph) = program_header {
-                    ph.p_filesz += if sh.sh_type == SHT_NOBITS { 0 } else { sh.sh_size };
-                    ph.p_memsz += sh.sh_size;
-                    sh.set_address(self.p_vaddr);
-                    self.p_vaddr += sh.sh_size;
-                }
             }
         }
     }
@@ -833,12 +860,18 @@ const fn round_to(val: u64, multiple: u64) -> u64 {
 
 const PAGE_ALIGNMENT: u64 = 0x1000;
 
-fn get_load_program_header(sh: &mut Section, p_vaddr: &mut u64) -> Option<ProgramHeader> {
+fn get_load_program_header(
+    sh: &mut Section,
+    file_offset: &mut u64,
+    p_vaddr: &mut u64,
+) -> Option<ProgramHeader> {
     if sh.sh_flags as u32 & SHF_ALLOC == SHF_ALLOC {
         let write = if sh.sh_flags as u32 & SHF_WRITE == SHF_WRITE { PF_W } else { 0 };
         let exec = if sh.sh_flags as u32 & SHF_EXECINSTR == SHF_EXECINSTR { PF_X } else { 0 };
         *p_vaddr = round_to(*p_vaddr, PAGE_ALIGNMENT);
         sh.set_address(*p_vaddr);
+        *file_offset = round_to(*file_offset, PAGE_ALIGNMENT);
+        sh.sh_offset = post_inc(file_offset, sh.size_on_disk());
         Some(ProgramHeader {
             p_type: PT_LOAD,
             p_flags: PF_R | write | exec,
@@ -846,7 +879,7 @@ fn get_load_program_header(sh: &mut Section, p_vaddr: &mut u64) -> Option<Progra
             p_offset: sh.sh_offset,
             p_vaddr: *p_vaddr,
             p_paddr: post_inc(p_vaddr, sh.sh_size),
-            p_filesz: if sh.sh_type == SHT_NOBITS { 0 } else { sh.sh_size },
+            p_filesz: sh.size_on_disk(),
             p_memsz: sh.sh_size,
         })
     } else {
@@ -860,7 +893,8 @@ fn dyn_entries(names: &StringTable, sh: &SectionHeader) -> usize {
         ".init" | ".fini" => 1,
         ".rela.dyn" => 4,
         _ => match sh.sh_type {
-            SHT_DYNSYM | SHT_STRTAB | SHT_INIT_ARRAY | SHT_FINI_ARRAY => 2,
+            SHT_DYNSYM | SHT_INIT_ARRAY | SHT_FINI_ARRAY => 2,
+            SHT_STRTAB if sh.sh_flags & SHF_ALLOC as u64 == SHF_ALLOC as u64 => 2,
             SHT_HASH | SHT_GNU_HASH => 1,
             _ => 0,
         },
@@ -884,7 +918,7 @@ fn try_add_dyn_entries(entries: &mut Vec<(DynTag, u64)>, names: &StringTable, sh
             SHT_DYNSYM => {
                 entries.extend(&[(DynTag::SymTab, sh.sh_addr), (DynTag::SymEnt, sh.sh_entsize)])
             }
-            SHT_STRTAB => {
+            SHT_STRTAB if sh.sh_flags & SHF_ALLOC as u64 == SHF_ALLOC as u64 => {
                 entries.extend(&[(DynTag::StrTab, sh.sh_addr), (DynTag::StrSize, sh.sh_size)])
             }
             SHT_INIT_ARRAY => entries

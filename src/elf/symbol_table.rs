@@ -56,7 +56,7 @@ impl<'p> SymbolTable<'p> {
                 sh_name,
                 sh_type: if is_dynamic { SHT_DYNSYM } else { SHT_SYMTAB },
                 sh_entsize: size_of::<Sym>() as u64,
-                sh_flags: SHF_ALLOC as u64,
+                sh_flags: if is_dynamic { SHF_ALLOC as u64 } else { 0 },
                 sh_addralign: std::mem::align_of::<u64>() as u64,
                 ..Default::default()
             },
