@@ -11,6 +11,7 @@ use goblin::elf64::{
     sym::Sym,
 };
 use std::{
+    cmp::Ordering,
     collections::HashMap,
     fs::File,
     io::Write,
@@ -260,7 +261,7 @@ impl<'d> Writer<'d> {
             got_plt: Default::default(),
             dyn_entries: vec![(DynTag::Needed, interp_entry.offset as u64)],
             program_headers: vec![],
-            p_vaddr: 0x40000,
+            p_vaddr: 0x200000,
             file_offset: size_of::<Header>() as u64,
             shstr_section: 1,
             sym_str_section: 2,
@@ -609,7 +610,37 @@ impl<'d> Writer<'d> {
         section.sh_link = self.dyn_sym_section as u32;
     }
 
-    pub fn assign_section_addresses(&mut self) {
+    fn sort_sections(&mut self) {
+        let null_sect = self.sections.remove(0);
+        self.sections.sort_unstable_by(section_cmp);
+        self.sections.insert(0, null_sect);
+        for (i, section) in self.sections.iter().enumerate() {
+            let sh_name = section.sh_name as usize;
+            if sh_name == self.section_names.sh_name(".shstrtab") {
+                self.shstr_section = i;
+            } else if sh_name == self.section_names.sh_name(".strtab") {
+                self.sym_str_section = i;
+            } else if sh_name == self.section_names.sh_name(".dynstr") {
+                self.dyn_sym_str_section = i;
+            } else if sh_name == self.section_names.sh_name(".symtab") {
+                self.sym_section = i;
+            } else if sh_name == self.section_names.sh_name(".dynsym") {
+                self.dyn_sym_section = i;
+            } else if sh_name == self.section_names.sh_name(".got") {
+                self.got_section = i;
+            } else if sh_name == self.section_names.sh_name(".plt") {
+                self.plt_section = i;
+            } else if sh_name == self.section_names.sh_name(".got.plt") {
+                self.got_plt_section = i;
+            } else if sh_name == self.section_names.sh_name(".dynamic") {
+                self.dynamic_section = i;
+            } else if sh_name == self.section_names.sh_name(".rela.dyn") {
+                self.dyn_rel_section = i;
+            }
+        }
+    }
+
+    fn assign_section_addresses(&mut self) {
         self.resize_got_section();
         self.resize_got_plt_section();
         self.resize_plt_section();
@@ -654,18 +685,21 @@ impl<'d> Writer<'d> {
             (self.dyn_rels.len() * size_of::<Rela>()) as u64;
 
         // calculate how many dyntags we have, so that we know how big our dynamic section is
-        for section in &mut self.sections {
-            try_add_dyn_entries(&mut self.dyn_entries, &self.section_names, section);
-        }
+        // + 1 for the null entry
+        let extra_dyn_entries = self
+            .sections
+            .iter()
+            .map(|sh| dyn_entries(&self.section_names, sh))
+            .fold(0, |acc, f| acc + f)
+            + 1;
         self.sections[self.dynamic_section].sh_size =
-            (self.dyn_entries.len() * 2 * size_of::<u64>()) as u64;
+            ((self.dyn_entries.len() + extra_dyn_entries) * 2 * size_of::<u64>()) as u64;
 
-        for section in &mut self.sections {
-            section.sh_offset = post_inc(&mut self.file_offset, section.size_on_disk());
-            if let Some(ph) = get_program_header(&self.section_names, section, &mut self.p_vaddr) {
-                self.program_headers.push(ph);
-            }
-        }
+        self.sort_sections();
+
+        self.generate_program_headers();
+
+        self.add_dyn_entries();
 
         self.patch_got_plt();
     }
@@ -742,6 +776,51 @@ impl<'d> Writer<'d> {
             offset += ph.serialize(&mut self.out);
         }
     }
+
+    fn generate_program_headers(&mut self) {
+        let mut flags = 0;
+        let mut program_header = None;
+        for sh in &mut self.sections {
+            sh.sh_offset = post_inc(&mut self.file_offset, sh.size_on_disk());
+            if let Some(p_type) = p_type(&self.section_names, &sh) {
+                // for .interp or .dynamic we have some extra program headers we want to generate
+                self.program_headers.insert(
+                    0,
+                    ProgramHeader {
+                        p_type,
+                        p_flags: PF_R,
+                        p_align: sh.sh_addralign,
+                        p_offset: sh.sh_offset,
+                        p_vaddr: self.p_vaddr,
+                        p_paddr: self.p_vaddr,
+                        p_filesz: if sh.sh_type == SHT_NOBITS { 0 } else { sh.sh_size },
+                        p_memsz: sh.sh_size,
+                    },
+                )
+            }
+            if sh.sh_flags != flags {
+                program_header = get_load_program_header(sh, &mut self.p_vaddr);
+                if let Some(ph) = program_header {
+                    self.program_headers.push(ph);
+                }
+                flags = sh.sh_flags;
+            } else {
+                if let Some(mut ph) = program_header {
+                    ph.p_filesz += if sh.sh_type == SHT_NOBITS { 0 } else { sh.sh_size };
+                    ph.p_memsz += sh.sh_size;
+                    sh.set_address(self.p_vaddr);
+                    self.p_vaddr += sh.sh_size;
+                }
+            }
+        }
+    }
+
+    fn add_dyn_entries(&mut self) {
+        for sh in &self.sections {
+            try_add_dyn_entries(&mut self.dyn_entries, &self.section_names, sh);
+        }
+        self.dyn_entries.push((DynTag::Null, 0));
+    }
 }
 
 const fn round_to(val: u64, multiple: u64) -> u64 {
@@ -752,20 +831,18 @@ const fn round_to(val: u64, multiple: u64) -> u64 {
     val + if rem != 0 { multiple - rem } else { 0 }
 }
 
-fn get_program_header(
-    names: &StringTable,
-    sh: &mut Section,
-    p_vaddr: &mut u64,
-) -> Option<ProgramHeader> {
+const PAGE_ALIGNMENT: u64 = 0x1000;
+
+fn get_load_program_header(sh: &mut Section, p_vaddr: &mut u64) -> Option<ProgramHeader> {
     if sh.sh_flags as u32 & SHF_ALLOC == SHF_ALLOC {
         let write = if sh.sh_flags as u32 & SHF_WRITE == SHF_WRITE { PF_W } else { 0 };
         let exec = if sh.sh_flags as u32 & SHF_EXECINSTR == SHF_EXECINSTR { PF_X } else { 0 };
-        *p_vaddr = round_to(*p_vaddr, sh.sh_addralign);
+        *p_vaddr = round_to(*p_vaddr, PAGE_ALIGNMENT);
         sh.set_address(*p_vaddr);
         Some(ProgramHeader {
-            p_type: p_type(names, sh),
+            p_type: PT_LOAD,
             p_flags: PF_R | write | exec,
-            p_align: sh.sh_addralign,
+            p_align: PAGE_ALIGNMENT,
             p_offset: sh.sh_offset,
             p_vaddr: *p_vaddr,
             p_paddr: post_inc(p_vaddr, sh.sh_size),
@@ -774,6 +851,19 @@ fn get_program_header(
         })
     } else {
         None
+    }
+}
+
+fn dyn_entries(names: &StringTable, sh: &SectionHeader) -> usize {
+    let name = names.name(sh.sh_name as usize).unwrap();
+    match name as &str {
+        ".init" | ".fini" => 1,
+        ".rela.dyn" => 4,
+        _ => match sh.sh_type {
+            SHT_DYNSYM | SHT_STRTAB | SHT_INIT_ARRAY | SHT_FINI_ARRAY => 2,
+            SHT_HASH | SHT_GNU_HASH => 1,
+            _ => 0,
+        },
     }
 }
 
@@ -808,11 +898,11 @@ fn try_add_dyn_entries(entries: &mut Vec<(DynTag, u64)>, names: &StringTable, sh
     };
 }
 
-fn p_type(names: &StringTable, sh: &SectionHeader) -> u32 {
+fn p_type(names: &StringTable, sh: &SectionHeader) -> Option<u32> {
     match sh.sh_type {
-        SHT_DYNAMIC => PT_DYNAMIC,
-        _ if names.name(sh.sh_name as usize).unwrap() as &str == ".interp" => PT_INTERP,
-        _ => PT_LOAD,
+        SHT_DYNAMIC => Some(PT_DYNAMIC),
+        _ if names.name(sh.sh_name as usize).unwrap() as &str == ".interp" => Some(PT_INTERP),
+        _ => None,
     }
 }
 
@@ -820,4 +910,11 @@ fn post_inc(v: &mut u64, inc: u64) -> u64 {
     let tmp = *v;
     *v += inc;
     tmp
+}
+
+fn section_cmp(s1: &Section, s2: &Section) -> Ordering {
+    match s1.sh_flags.cmp(&s2.sh_flags) {
+        Ordering::Equal => s1.sh_addralign.cmp(&s2.sh_addralign).reverse(),
+        o => o,
+    }
 }

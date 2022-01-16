@@ -61,9 +61,13 @@ impl StringTable {
         Entry { index: *i, offset: *offset, new }
     }
 
-    pub fn get(&mut self, name: impl Into<Name>) -> Option<Entry> {
+    pub fn get(&self, name: impl Into<Name>) -> Option<Entry> {
         let name = name.into();
         self.names.get(&name).map(|(i, o)| Entry { index: *i, offset: *o, new: false })
+    }
+
+    pub fn sh_name(&self, name: impl Into<Name>) -> usize {
+        self.names.get(&name.into()).unwrap().1
     }
 
     pub fn name(&self, offset: usize) -> Option<&Name> {
