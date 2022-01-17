@@ -558,14 +558,26 @@ impl<'d> Writer<'d> {
                 s.st_shndx = SHN_ABS as u16;
             };
         }
-        if self.section_names.get(".init_array").is_some() {
-            let init_array_start = self.symbol_names.get("__init_array_start");
-            let init_array_end = self.symbol_names.get("__init_array_end");
-            if let (Some(start), Some(end)) = (init_array_start, init_array_end) {
-                for s in [start, end] {
-                    let sym = self.symbols.get_mut(SymbolRef { st_name: s.offset as u32 }).unwrap();
-                    sym.st_shndx = SHN_ABS as u16;
-                }
+        let symbols = &mut self.symbols;
+        for section in &mut self.sections {
+            if section.sh_name == self.section_names.sh_name(".init_array") {
+                self.symbol_names.get("__init_array_start").map(|s| {
+                    section.chunk_mut(0).add_symbol(SymbolRef { st_name: s.offset as u32 });
+                });
+                self.symbol_names.get("__init_array_end").map(|s| {
+                    let sym_ref = SymbolRef { st_name: s.offset as u32 };
+                    symbols.get_mut(sym_ref).unwrap().st_value = section.size_on_disk();
+                    section.chunk_mut(section.last_chunk_index()).add_symbol(sym_ref);
+                });
+            } else if section.sh_name == self.section_names.sh_name(".fini_array") {
+                self.symbol_names.get("__fini_array_start").map(|s| {
+                    section.chunk_mut(0).add_symbol(SymbolRef { st_name: s.offset as u32 });
+                });
+                self.symbol_names.get("__fini_array_end").map(|s| {
+                    let sym_ref = SymbolRef { st_name: s.offset as u32 };
+                    symbols.get_mut(sym_ref).unwrap().st_value = section.size_on_disk();
+                    section.chunk_mut(section.last_chunk_index()).add_symbol(sym_ref);
+                });
             }
         }
     }
@@ -616,7 +628,7 @@ impl<'d> Writer<'d> {
         self.sections.sort_unstable_by(section_cmp);
         self.sections.insert(0, null_sect);
         for (i, section) in self.sections.iter().enumerate() {
-            let sh_name = section.sh_name as usize;
+            let sh_name = section.sh_name;
             if sh_name == self.section_names.sh_name(".shstrtab") {
                 self.shstr_section = i;
             } else if sh_name == self.section_names.sh_name(".strtab") {
@@ -640,7 +652,7 @@ impl<'d> Writer<'d> {
             }
         }
         for section in &mut self.sections {
-            let sh_name = section.sh_name as usize;
+            let sh_name = section.sh_name;
             if sh_name == self.section_names.sh_name(".hash")
                 || sh_name == self.section_names.sh_name(".gnu.hash")
             {
