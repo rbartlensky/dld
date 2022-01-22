@@ -61,8 +61,10 @@ impl Section {
         for chunk in &self.chunks {
             for symbol_ref in chunk.symbols() {
                 if let Some(symbol) = table.get_mut(*symbol_ref) {
-                    symbol.st_value += base_addr;
-                    symbol.st_shndx = sh_index;
+                    if symbol.st_name != 0 {
+                        symbol.st_value += base_addr;
+                        symbol.st_shndx = sh_index;
+                    }
                 }
             }
             base_addr += chunk.len() as u64;

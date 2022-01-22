@@ -93,10 +93,7 @@ impl<'r> Symbol<'r> {
         let s2 = sym.st_bind();
         !matches!(
             (s1, s2),
-            (STB_LOCAL, STB_LOCAL)
-                | (STB_LOCAL, STB_WEAK)
-                | (STB_LOCAL, STB_GLOBAL)
-                | (STB_WEAK, STB_GLOBAL)
+            (STB_LOCAL, STB_WEAK) | (STB_LOCAL, STB_GLOBAL) | (STB_WEAK, STB_GLOBAL)
         )
     }
 

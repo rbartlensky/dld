@@ -94,7 +94,7 @@ impl<'p> SymbolTable<'p> {
                     old_sym.st_shndx = new_sym.st_shndx;
                     old_sym.st_value = new_sym.st_value;
                     old_sym.st_size = new_sym.st_size;
-                } else if old_sym.st_shndx == SHN_UNDEF as u16 {
+                } else if old_sym.st_shndx == SHN_UNDEF as u16 && old_sym.st_name != 0 {
                     old_sym.st_shndx = new_sym.st_shndx;
                 }
             }
