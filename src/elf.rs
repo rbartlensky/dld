@@ -812,6 +812,7 @@ impl<'d> Writer<'d> {
         let mut flags = 0;
         let mut program_header = None;
         for sh in self.sections.iter_mut().skip(1) {
+            let old_p_vaddr = self.p_vaddr;
             if sh.sh_flags != flags {
                 // push old program header
                 if let Some(ph) = program_header.take() {
@@ -836,16 +837,17 @@ impl<'d> Writer<'d> {
                 }
             }
             if let Some(p_type) = p_type(&self.section_names, &sh) {
+                let write = if sh.sh_flags as u32 & SHF_WRITE == SHF_WRITE { PF_W } else { 0 };
                 // for .interp or .dynamic we have some extra program headers we want to generate
                 self.program_headers.insert(
                     0,
                     ProgramHeader {
                         p_type,
-                        p_flags: PF_R,
+                        p_flags: PF_R | write,
                         p_align: sh.sh_addralign,
                         p_offset: sh.sh_offset,
-                        p_vaddr: self.p_vaddr,
-                        p_paddr: self.p_vaddr,
+                        p_vaddr: old_p_vaddr,
+                        p_paddr: old_p_vaddr,
                         p_filesz: sh.size_on_disk(),
                         p_memsz: sh.sh_size,
                     },
