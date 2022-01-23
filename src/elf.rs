@@ -264,14 +264,16 @@ impl<'d> Writer<'d> {
             program_headers: vec![],
             p_vaddr: 0x200000,
             file_offset: size_of::<Header>() as u64,
+            // XXX: I should really come up with a better way to store quick
+            // references to these special sections
             shstr_section: 1,
             sym_str_section: 2,
             dyn_sym_str_section: 3,
+            got_section: 5,
+            got_plt_section: 6,
+            plt_section: 7,
             sym_section: 8,
             dyn_sym_section: 9,
-            got_section: 5,
-            plt_section: 6,
-            got_plt_section: 7,
             dynamic_section: 10,
             dyn_rel_section: 11,
         })
