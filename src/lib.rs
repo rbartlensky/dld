@@ -49,73 +49,98 @@ impl Hash for Symbol {
     }
 }
 
-pub struct Input<'o> {
-    path: &'o Path,
-    data: Vec<u8>,
+pub struct Input<'p, 'd> {
+    path: &'p Path,
+    data: &'d [u8],
 }
 
-impl<'o> Input<'o> {
-    fn process<'e>(&'e self, writer: &mut elf::Writer<'o>) -> Result<(), Error<'o>> {
-        let elf = Elf::parse(&self.data).map_path_err(self.path)?;
-        if elf.is_object_file() {
-            Ok(process_elf_object(self.path, &self.data, elf, writer)?)
-        } else {
-            Ok(())
-        }
-    }
-}
-
-fn process_elf_object<'e, 'o>(
-    path: &'o Path,
-    data: &'e [u8],
+pub struct ElfObject<'i, 'p, 'd, 'e> {
+    input: &'i Input<'p, 'd>,
     elf: Elf<'e>,
-    writer: &mut elf::Writer<'o>,
-) -> Result<(), Error<'o>> {
-    let mut section_relocations = HashMap::new();
-    let mut symbols = HashMap::new();
-    for (i, section) in elf
-        .section_headers
-        .iter()
-        .enumerate()
-        .filter(|(_, sh)| !SKIPPED_SECTIONS.contains(&sh.sh_type))
-    {
-        let name = get_section_name(&elf, section.sh_name).map_path_err(path)?;
-        let section_ref =
-            writer.push_section(name.to_owned(), section, section.file_range().map(|r| &data[r]));
-        log::trace!("Section '{}:{}' of {:?} mapped to {:?}", i, name, path, section_ref);
-        section_relocations.insert(i, section_ref);
+    section_relocations: HashMap<usize, elf::SectionRef>,
+    symbols: HashMap<Symbol, elf::SymbolRef>,
+}
+
+impl<'p, 'd> Input<'p, 'd> {
+    fn into_elf_object<'i>(&'i self) -> Result<Option<ElfObject<'i, 'p, '_, 'i>>, Error<'p>> {
+        let elf = Elf::parse(&self.data).map_path_err(self.path)?;
+        Ok(if elf.is_object_file() { Some(ElfObject::new(self, elf)) } else { None })
     }
-    for symbol in &elf.syms {
-        let name = get_symbol_name(&elf, symbol.st_name).map_path_err(path)?;
-        let sec_ref = section_relocations.get(&(symbol.st_shndx as usize));
-        let symbol_ref =
-            writer.add_symbol(symbol.into(), sec_ref.copied(), name, path).map_path_err(path)?;
-        if let Some(sym) = symbol_ref {
-            symbols.insert(Symbol(symbol), sym);
+}
+
+impl<'i, 'p, 'd, 'e> ElfObject<'i, 'p, 'd, 'e> {
+    pub fn new(input: &'i Input<'p, 'd>, elf: Elf<'e>) -> Self {
+        Self { input, elf, section_relocations: Default::default(), symbols: Default::default() }
+    }
+
+    pub fn process_sections(&mut self, writer: &mut elf::Writer<'p>) -> Result<(), Error<'p>> {
+        for (i, section) in self
+            .elf
+            .section_headers
+            .iter()
+            .enumerate()
+            .filter(|(_, sh)| !SKIPPED_SECTIONS.contains(&sh.sh_type))
+        {
+            let name =
+                get_section_name(&self.elf, section.sh_name).map_path_err(self.input.path)?;
+            let section_ref = writer.push_section(
+                name.to_owned(),
+                section,
+                section.file_range().map(|r| &self.input.data[r]),
+            );
+            log::trace!(
+                "Section '{}:{}' of {:?} mapped to {:?}",
+                i,
+                name,
+                self.input.path,
+                section_ref
+            );
+            self.section_relocations.insert(i, section_ref);
         }
+        Ok(())
     }
-    for (section_index, rels) in &elf.shdr_relocs {
-        for rel in rels.iter().filter(|r| r.r_sym != 0) {
-            let symbol = &elf.syms.get(rel.r_sym as usize).unwrap();
-            let index = if let Some(sec) = section_relocations.get(&(section_index - 1)) {
-                *sec
-            } else {
-                continue;
-            };
-            let symbol = if let Some(sym) = symbols.get(&Symbol(*symbol)) {
-                sym
-            } else {
-                continue;
-            };
-            let rela = Rela {
-                r_offset: rel.r_offset,
-                r_info: ((rel.r_sym << 32) + rel.r_type as usize) as u64,
-                r_addend: rel.r_addend.unwrap_or_default() as i64,
-            };
-            writer.add_relocation(rela, *symbol, index).map_path_err(path)?;
+
+    pub fn process_symbols(&mut self, writer: &mut elf::Writer<'p>) -> Result<(), Error<'p>> {
+        let path = &self.input.path;
+        let elf = &self.elf;
+        for symbol in &elf.syms {
+            let name = get_symbol_name(&elf, symbol.st_name).map_path_err(path)?;
+            let sec_ref = self.section_relocations.get(&(symbol.st_shndx as usize));
+            let symbol_ref = writer
+                .add_symbol(symbol.into(), sec_ref.copied(), name, path)
+                .map_path_err(path)?;
+            if let Some(sym) = symbol_ref {
+                self.symbols.insert(Symbol(symbol), sym);
+            }
         }
+        Ok(())
     }
-    Ok(())
+
+    pub fn process_relocations(&self, writer: &mut elf::Writer<'p>) -> Result<(), Error<'p>> {
+        let elf = &self.elf;
+        for (section_index, rels) in &elf.shdr_relocs {
+            for rel in rels.iter().filter(|r| r.r_sym != 0) {
+                let symbol = &elf.syms.get(rel.r_sym as usize).unwrap();
+                let index = if let Some(sec) = self.section_relocations.get(&(section_index - 1)) {
+                    *sec
+                } else {
+                    continue;
+                };
+                let symbol = if let Some(sym) = self.symbols.get(&Symbol(*symbol)) {
+                    sym
+                } else {
+                    continue;
+                };
+                let rela = Rela {
+                    r_offset: rel.r_offset,
+                    r_info: ((rel.r_sym << 32) + rel.r_type as usize) as u64,
+                    r_addend: rel.r_addend.unwrap_or_default() as i64,
+                };
+                writer.add_relocation(rela, *symbol, index).map_path_err(self.input.path)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct Linker {
@@ -177,8 +202,11 @@ impl Linker {
                 let object = ar.get(member).unwrap();
                 let object_data =
                     &data[(object.offset as usize)..(object.offset as usize + object.size())];
-                let elf = Elf::parse(object_data).unwrap();
-                process_elf_object(path, object_data, elf, writer)?;
+                let input = Input { path, data: object_data };
+                let mut elf = input.into_elf_object()?.unwrap();
+                elf.process_sections(writer)?;
+                elf.process_symbols(writer)?;
+                elf.process_relocations(writer)?;
             }
             undefines.retain(|_, found| !*found);
         }
@@ -188,19 +216,30 @@ impl Linker {
     pub fn link(&self) -> Result<(), Error<'_>> {
         let mut writer =
             elf::Writer::new(&self.options).map_path_err(self.options.output.as_path())?;
-        let objects = self
-            .objects
+        let mut elf_data = Vec::with_capacity(self.objects.len());
+        for obj in &self.objects {
+            let path = obj.as_path();
+            let data = read(path).map_path_err(path)?;
+            elf_data.push(data);
+        }
+        let inputs = elf_data
             .iter()
-            .map(|p| {
-                let path = p.as_path();
-                let data = read(path).map_path_err(path)?;
-                Ok(Input { data, path })
-            })
+            .zip(self.objects.iter())
+            .map(|(data, path)| Ok(Input { data, path }))
             .collect::<Result<Vec<Input>, Error<'_>>>()?;
-        let _ = objects
-            .iter()
-            .map(|o| o.process(&mut writer))
-            .collect::<Result<Vec<()>, Error<'_>>>()?;
+        let mut elfs = Vec::with_capacity(inputs.len());
+        for input in &inputs {
+            if let Some(mut elf) = input.into_elf_object()? {
+                elf.process_sections(&mut writer)?;
+                elfs.push(elf);
+            };
+        }
+        for elf in &mut elfs {
+            elf.process_symbols(&mut writer)?;
+        }
+        for elf in &mut elfs {
+            elf.process_relocations(&mut writer)?;
+        }
         let undefined = writer.undefined_symbols();
         let undefined = self.find_undefined_symbols_in_libs(undefined, &mut writer)?;
         self.process_archives_containing(undefined, &mut writer)?;
