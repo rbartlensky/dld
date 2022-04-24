@@ -16,6 +16,7 @@ use std::{
     fs::File,
     io::Write,
     mem::{align_of, size_of},
+    os::unix::prelude::PermissionsExt,
     path::Path,
 };
 
@@ -835,6 +836,9 @@ impl<'d> Writer<'d> {
             log::trace!("0x{:x}: ---- prog header {} ----\n{:#?}", offset, i, ph);
             offset += ph.serialize(&mut self.out);
         }
+        let mut perm = self.out.metadata().unwrap().permissions();
+        perm.set_mode(0o755);
+        self.out.set_permissions(perm).unwrap();
     }
 
     fn generate_program_headers(&mut self) {

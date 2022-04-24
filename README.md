@@ -4,4 +4,7 @@ A very WIP linker.
 
 ### Try it out
 
-`cargo run -- ./tests/obj-files/f.o ./tests/obj-files/f2.o -o test`
+```
+$ cargo build && clang -o test ./tests/c/main.c -fuse-ld=/path/to/dld/target/debug/dld
+$ ./test # works
+```
