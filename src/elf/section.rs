@@ -1,4 +1,4 @@
-use crate::elf::chunk::Chunk;
+use crate::elf::{chunk::Chunk, SymbolRef};
 
 use goblin::elf64::section_header::{SectionHeader, SHT_NOBITS};
 
@@ -56,14 +56,16 @@ impl Section {
         }
     }
 
-    pub fn patch_symbol_values(&self, sh_index: u16, table: &mut crate::elf::SymbolTable) {
+    pub fn patch_symbol_values(&mut self, sh_index: u16, table: &mut crate::elf::SymbolTable) {
         let mut base_addr = self.sh_addr;
         for chunk in &self.chunks {
-            for symbol_ref in chunk.symbols() {
+            for symbol_ref in chunk.symbols().iter() {
                 if let Some(symbol) = table.get_mut(*symbol_ref) {
-                    if symbol.st_name != 0 {
+                    symbol.st_shndx = sh_index;
+                    if matches!(symbol_ref, SymbolRef::Section(..)) {
+                        symbol.st_value = base_addr;
+                    } else {
                         symbol.st_value += base_addr;
-                        symbol.st_shndx = sh_index;
                     }
                 }
             }

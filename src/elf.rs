@@ -340,7 +340,7 @@ impl<'d> Writer<'d> {
         reference: &'d Path,
         symbol_names: &mut StringTable,
         symbols: &mut SymbolTable<'d>,
-    ) -> Result<Option<SymbolRef>, ErrorType> {
+    ) -> Result<SymbolRef, ErrorType> {
         let name: Name = name.to_string().into();
         let hash = name.elf_hash();
         let gnu_hash = name.elf_gnu_hash();
@@ -352,7 +352,7 @@ impl<'d> Writer<'d> {
             .map_err(|e| ErrorType::Other(format!("{} {}", &name as &str, e)))?;
         if let Some(chunk) = chunk {
             if elf_sym.st_shndx != SHN_ABS as u16 {
-                r.map(|sym| chunk.add_symbol(sym));
+                chunk.add_symbol(r);
             }
         }
         Ok(r)
@@ -360,12 +360,14 @@ impl<'d> Writer<'d> {
 
     pub fn add_symbol<'s>(
         &mut self,
-        elf_sym: Sym,
+        mut elf_sym: Sym,
         sec_ref: Option<SectionRef>,
         name: &'s str,
         reference: &'d Path,
     ) -> Result<Option<SymbolRef>, ErrorType> {
         let chunk = if let Some(s) = sec_ref {
+            // since smybol should point to the new section we're creating
+            elf_sym.st_shndx = s.index as u16;
             Some(self.sections[s.index].chunk_mut(s.chunk))
         } else {
             None
@@ -378,6 +380,7 @@ impl<'d> Writer<'d> {
             &mut self.symbol_names,
             &mut self.symbols,
         )
+        .map(Some)
     }
 
     pub fn add_dyn_symbol<'s>(
@@ -403,15 +406,15 @@ impl<'d> Writer<'d> {
             &mut self.dyn_symbol_names,
             &mut self.dyn_symbols,
         );
-        if let Ok(Some(dyn_ref)) = r {
+        if let Ok(dyn_ref) = r {
             if let Some(entry) = self.symbol_names.get(name.to_string()) {
                 self.symbols
-                    .get_mut(SymbolRef { st_name: entry.offset as u32 })
+                    .get_mut(SymbolRef::Named(entry.offset as u32))
                     .unwrap()
                     .set_dynamic(dyn_ref);
             }
         }
-        r
+        r.map(Some)
     }
 
     pub fn symbol(&self, sym: SymbolRef) -> Symbol<'_> {
@@ -419,17 +422,21 @@ impl<'d> Writer<'d> {
     }
 
     pub fn symbol_name(&self, sym: SymbolRef) -> &str {
-        self.symbol_names.name(sym.st_name as usize).unwrap()
+        if let SymbolRef::Named(st_name) = sym {
+            self.symbol_names.name(st_name as usize).unwrap()
+        } else {
+            ""
+        }
     }
 
     pub fn undefined_symbols(&self) -> Vec<SymbolRef> {
         let mut undefined = vec![];
-        for (st_name, sym) in self.symbols.iter() {
+        for (st_name, sym) in self.symbols.named().iter() {
             if sym.st_shndx as u32 == SHN_UNDEF
                 && (sym.is_global() || sym.is_weak())
                 && sym.dynamic().is_none()
             {
-                undefined.push(SymbolRef { st_name: *st_name });
+                undefined.push(SymbolRef::Named(*st_name));
             }
         }
         undefined
@@ -449,39 +456,10 @@ impl<'d> Writer<'d> {
                     r_type
                 )));
             }
-            R_X86_64_GOT32
-            | R_X86_64_GOTPCREL
-            | R_X86_64_GOTOFF64
-            | R_X86_64_GOTPC32
-            | R_X86_64_GOTPCRELX
-            | R_X86_64_REX_GOTPCRELX
-            | R_X86_64_TLSGD
-            | R_X86_64_GOTTPOFF => self.add_got_entry(sym_ref, r_type),
-            R_X86_64_PLT32 => self.add_plt_entry(sym_ref),
             _ => {}
         }
         self.chunk(section_ref).add_relocation(reloc, sym_ref);
         Ok(())
-    }
-
-    pub fn add_got_entry(&mut self, sym: SymbolRef, r_type: u32) {
-        let sym = self.symbols.get_mut(sym).unwrap();
-        if sym.got_offset().is_none() {
-            sym.set_got_offset(self.got_len * size_of::<u64>());
-            // For TLSGD relocations we need to allocate two slots
-            self.got_len += if sym.is_tls() && r_type == R_X86_64_TLSGD { 2 } else { 1 };
-        }
-    }
-
-    pub fn add_plt_entry(&mut self, sym: SymbolRef) {
-        let len = self.plt.len();
-        let index = *self.plt.entry(sym).or_insert(len);
-        let len = self.got_plt.len() + 3;
-        let offset = *self.got_plt.entry(sym).or_insert(len * size_of::<u64>());
-
-        let sym = self.symbols.get_mut(sym).unwrap();
-        sym.set_got_plt_offset(offset);
-        sym.set_plt_index(index);
     }
 
     pub fn got_address(&self) -> u64 {
@@ -556,7 +534,7 @@ impl<'d> Writer<'d> {
     fn handle_special_symbols(&mut self) {
         // TODO: handle more edge cases
         if let Some(e) = self.symbol_names.get("_GLOBAL_OFFSET_TABLE_") {
-            if let Some(s) = self.symbols.get_mut(SymbolRef { st_name: e.offset as u32 }) {
+            if let Some(s) = self.symbols.get_mut(SymbolRef::Named(e.offset as u32)) {
                 s.st_shndx = SHN_ABS as u16;
             };
         }
@@ -564,19 +542,19 @@ impl<'d> Writer<'d> {
         for section in &mut self.sections {
             if section.sh_name == self.section_names.sh_name(".init_array") {
                 self.symbol_names.get("__init_array_start").map(|s| {
-                    section.chunk_mut(0).add_symbol(SymbolRef { st_name: s.offset as u32 });
+                    section.chunk_mut(0).add_symbol(SymbolRef::Named(s.offset as u32));
                 });
                 self.symbol_names.get("__init_array_end").map(|s| {
-                    let sym_ref = SymbolRef { st_name: s.offset as u32 };
+                    let sym_ref = SymbolRef::Named(s.offset as u32);
                     symbols.get_mut(sym_ref).unwrap().st_value = section.size_on_disk();
                     section.chunk_mut(section.last_chunk_index()).add_symbol(sym_ref);
                 });
             } else if section.sh_name == self.section_names.sh_name(".fini_array") {
                 self.symbol_names.get("__fini_array_start").map(|s| {
-                    section.chunk_mut(0).add_symbol(SymbolRef { st_name: s.offset as u32 });
+                    section.chunk_mut(0).add_symbol(SymbolRef::Named(s.offset as u32));
                 });
                 self.symbol_names.get("__fini_array_end").map(|s| {
-                    let sym_ref = SymbolRef { st_name: s.offset as u32 };
+                    let sym_ref = SymbolRef::Named(s.offset as u32);
                     symbols.get_mut(sym_ref).unwrap().st_value = section.size_on_disk();
                     section.chunk_mut(section.last_chunk_index()).add_symbol(sym_ref);
                 });
@@ -656,14 +634,61 @@ impl<'d> Writer<'d> {
         for section in &mut self.sections {
             let sh_name = section.sh_name;
             if sh_name == self.section_names.sh_name(".hash")
-                || sh_name == self.section_names.sh_name(".gnu.hash")
+            // || sh_name == self.section_names.sh_name(".gnu.hash")
             {
                 section.sh_link = self.dyn_sym_section as u32;
             }
         }
     }
 
+    fn scan_relocations(&mut self) {
+        for section in &mut self.sections {
+            for chunk in section.chunks_mut() {
+                for (reloc, sym_ref) in chunk.relocations_mut() {
+                    let r_type = reloc.r_info as u32;
+                    match r_type as u32 {
+                        R_X86_64_GOT32
+                        | R_X86_64_GOTPCREL
+                        | R_X86_64_GOTOFF64
+                        | R_X86_64_GOTPC32
+                        | R_X86_64_GOTPCRELX
+                        | R_X86_64_REX_GOTPCRELX
+                        | R_X86_64_TLSGD
+                        | R_X86_64_GOTTPOFF => {
+                            let sym = self.symbols.get_mut(*sym_ref).unwrap();
+                            if sym.got_offset().is_none() {
+                                sym.set_got_offset(self.got_len * size_of::<u64>());
+                                // For TLSGD relocations we need to allocate two slots
+                                self.got_len +=
+                                    if sym.is_tls() && r_type == R_X86_64_TLSGD { 2 } else { 1 };
+                            }
+                        }
+                        R_X86_64_PLT32 => {
+                            let sym = self.symbols.get_mut(*sym_ref).unwrap();
+                            if sym.dynamic().is_some() {
+                                let len = self.plt.len();
+                                let index = *self.plt.entry(*sym_ref).or_insert(len);
+                                let len = self.got_plt.len() + 3;
+                                let offset =
+                                    *self.got_plt.entry(*sym_ref).or_insert(len * size_of::<u64>());
+                                sym.set_got_plt_offset(offset);
+                                sym.set_plt_index(index);
+                            } else {
+                                // replace PLT32 with PC32 since the symbol is local to us
+                                reloc.r_info -= r_type as u64;
+                                reloc.r_info += R_X86_64_PC32 as u64;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     fn assign_section_addresses(&mut self) {
+        self.scan_relocations();
+
         self.resize_got_section();
         self.resize_got_plt_section();
         self.resize_plt_section();
@@ -676,7 +701,8 @@ impl<'d> Writer<'d> {
             let sec = SymbolTable::hash_section(hash_name as u32, &sorted[..]);
             self.sections.push(sec);
         }
-        if self.hash_style == HashStyle::Gnu || self.hash_style == HashStyle::Both {
+        // TODO: not working
+        if self.hash_style == HashStyle::Gnu {
             let hash_name = self.section_names.get_or_create(".gnu.hash").offset;
             let sec = SymbolTable::gnu_hash_section(hash_name as u32, &sorted[..]);
             self.sections.push(sec);
@@ -686,13 +712,15 @@ impl<'d> Writer<'d> {
         self.sections[self.sym_str_section].sh_size = self.symbol_names.total_len() as u64;
         self.sections[self.dyn_sym_str_section].sh_size = self.dyn_symbol_names.total_len() as u64;
 
-        for (sym, dyn_sym) in self.symbols.values().filter_map(|s| s.dynamic().map(|d| (s, d))) {
+        for (sym, dyn_sym) in
+            self.symbols.named().values().filter_map(|s| s.dynamic().map(|d| (s, d)))
+        {
             if let Some(offset) = sym.got_offset() {
                 // XXX: this should be more efficient
                 let index = sorted
                     .iter()
                     .enumerate()
-                    .find(|(_, s)| s.st_name == dyn_sym.st_name)
+                    .find(|(_, s)| s.st_name == dyn_sym.st_name())
                     .map(|(i, _)| i)
                     .unwrap();
                 self.dyn_rels.push(Rela {
@@ -756,7 +784,7 @@ impl<'d> Writer<'d> {
         self.compute_tables();
 
         if let Some(entry) = self.symbol_names.get("_start") {
-            self.eh.e_entry = self.symbols[&(entry.offset as u32)].st_value;
+            self.eh.e_entry = self.symbols[SymbolRef::Named(entry.offset as u32)].st_value;
         }
         self.eh.e_shnum = self.sections.len() as u16;
         self.eh.e_phnum = self.program_headers.len() as u16;
@@ -774,7 +802,6 @@ impl<'d> Writer<'d> {
         for (i, section) in self.sections.iter().enumerate() {
             // add the necessary padding between aligned sections
             if offset < section.sh_offset as usize {
-                log::error!("Extra stuff added: {:x}", section.sh_offset as usize - offset);
                 self.out
                     .write_all(
                         &std::iter::repeat(0)

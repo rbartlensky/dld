@@ -1,7 +1,9 @@
 use byteorder::{LittleEndian, WriteBytesExt};
-use goblin::elf64::header::EM_X86_64;
-use goblin::elf64::reloc::{Rela, *};
-use std::{convert::TryInto, io::Write};
+use goblin::elf64::{
+    header::EM_X86_64,
+    reloc::{Rela, *},
+};
+use std::{collections::HashSet, convert::TryInto, io::Write};
 
 use crate::elf::{SymbolRef, SymbolTable};
 
@@ -9,29 +11,33 @@ use crate::elf::{SymbolRef, SymbolTable};
 pub struct Chunk {
     address: Option<u64>,
     data: Vec<u8>,
-    symbols: Vec<SymbolRef>,
+    symbols: HashSet<SymbolRef>,
     relocations: Vec<(Rela, SymbolRef)>,
 }
 
 impl Chunk {
     pub fn new(data: Vec<u8>) -> Self {
-        Self { address: None, data, symbols: vec![], relocations: vec![] }
+        Self { address: None, data, symbols: Default::default(), relocations: vec![] }
     }
 
     pub fn add_symbol(&mut self, sym_ref: SymbolRef) {
-        self.symbols.push(sym_ref);
+        self.symbols.insert(sym_ref);
     }
 
     pub fn add_relocation(&mut self, reloc: Rela, sym_ref: SymbolRef) {
         self.relocations.push((reloc, sym_ref));
     }
 
-    pub fn symbols(&self) -> &[SymbolRef] {
-        &self.symbols[..]
+    pub fn symbols(&self) -> &HashSet<SymbolRef> {
+        &self.symbols
     }
 
     pub fn relocations(&self) -> &[(Rela, SymbolRef)] {
         &self.relocations
+    }
+
+    pub fn relocations_mut(&mut self) -> &mut [(Rela, SymbolRef)] {
+        &mut self.relocations
     }
 
     pub fn apply_relocations(&mut self, got_address: u64, plt_address: u64, table: &SymbolTable) {
@@ -77,7 +83,7 @@ impl std::ops::DerefMut for Chunk {
 }
 
 fn apply_relocation(
-    address: u64,
+    chunk_address: u64,
     data: &mut [u8],
     rel: Rela,
     symbol: &crate::elf::Symbol<'_>,
@@ -86,7 +92,7 @@ fn apply_relocation(
 ) {
     let s: i64 = symbol.st_value.try_into().unwrap();
     let a = rel.r_addend;
-    let p: i64 = (address + rel.r_offset).try_into().unwrap();
+    let p: i64 = (chunk_address + rel.r_offset).try_into().unwrap();
     let _z = symbol.st_size;
     let got: i64 = got_address.try_into().unwrap();
     let l: i64 = plt_address.try_into().unwrap();
@@ -106,7 +112,9 @@ fn apply_relocation(
             .unwrap(),
         R_X86_64_GOT32 => {
             let g: i64 = symbol.got_offset().unwrap().try_into().unwrap();
-            (&mut data[offset..]).write_i32::<LittleEndian>((g + a).try_into().unwrap()).unwrap()
+            (&mut data[offset..])
+                .write_i32::<LittleEndian>((g + got + a - p).try_into().unwrap())
+                .unwrap()
         }
         R_X86_64_GOTPCRELX if symbol.dynamic().is_none() => {
             // -2 because the offset points to where we need to patch, but we want to

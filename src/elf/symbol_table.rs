@@ -5,21 +5,34 @@ use goblin::elf64::{
     section_header::{
         SectionHeader, SHF_ALLOC, SHN_UNDEF, SHT_DYNSYM, SHT_GNU_HASH, SHT_HASH, SHT_SYMTAB,
     },
-    sym::Sym,
+    sym::{st_type, Sym, STT_SECTION},
 };
+use std::ops::Index;
 use std::{
     cmp::Ordering,
     collections::{hash_map::Entry, HashMap},
     mem::size_of,
-    ops::Deref,
     path::{Path, PathBuf},
 };
 use thiserror::Error;
 
-/// A symbol can be fetched by indexing `symbols` in the following way: `symbols[st_name][index]`.
+/// A symbol can be fetched by indexing `symbols` in the following way: `symbols[st_name]`.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub struct SymbolRef {
-    pub st_name: u32,
+pub enum SymbolRef {
+    Named(u32),
+    // section + number
+    Section(u16, usize),
+}
+
+impl SymbolRef {
+    pub fn st_name(&self) -> u32 {
+        if let Self::Named(n) = self {
+            *n
+        } else {
+            // SECTION symbols don't have a name
+            0
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -28,14 +41,17 @@ pub enum Error {
     AlreadyDefined(PathBuf),
 }
 
+#[derive(Debug)]
 pub struct SymbolTable<'p> {
     symbols: HashMap<u32, Symbol<'p>>,
+    section_syms: HashMap<u16, Vec<Symbol<'p>>>,
     num_locals: usize,
 }
 
 impl Default for SymbolTable<'_> {
     fn default() -> Self {
-        let mut table = Self { symbols: Default::default(), num_locals: 0 };
+        let mut table =
+            Self { symbols: Default::default(), section_syms: Default::default(), num_locals: 0 };
         table
             .add_symbol(
                 Sym { st_shndx: SHN_UNDEF as u16, ..Default::default() },
@@ -69,9 +85,20 @@ impl<'p> SymbolTable<'p> {
         hash: u32,
         gnu_hash: u32,
         reference: &'p Path,
-    ) -> Result<Option<SymbolRef>, Error> {
+    ) -> Result<SymbolRef, Error> {
         let st_name = elf_sym.st_name;
+        let st_type = st_type(elf_sym.st_info);
         let new_sym = Symbol::new(elf_sym, hash, gnu_hash, reference);
+        if st_type == STT_SECTION {
+            let len = self
+                .section_syms
+                .entry(elf_sym.st_shndx)
+                .and_modify(|v| v.push(new_sym))
+                .or_insert_with(|| vec![new_sym])
+                .len()
+                - 1;
+            return Ok(SymbolRef::Section(elf_sym.st_shndx, len));
+        }
         match self.symbols.entry(st_name) {
             Entry::Occupied(mut s) => {
                 let old_sym = s.get_mut();
@@ -94,7 +121,7 @@ impl<'p> SymbolTable<'p> {
                     old_sym.st_shndx = new_sym.st_shndx;
                     old_sym.st_value = new_sym.st_value;
                     old_sym.st_size = new_sym.st_size;
-                } else if old_sym.st_shndx == SHN_UNDEF as u16 && old_sym.st_name != 0 {
+                } else if old_sym.st_shndx == SHN_UNDEF as u16 {
                     old_sym.st_shndx = new_sym.st_shndx;
                 }
             }
@@ -105,20 +132,26 @@ impl<'p> SymbolTable<'p> {
                 v.insert(new_sym);
             }
         };
-        Ok(Some(SymbolRef { st_name }))
+        Ok(SymbolRef::Named(st_name))
     }
 
     pub fn get(&self, s: SymbolRef) -> Option<&Symbol<'_>> {
-        self.symbols.get(&s.st_name)
+        match s {
+            SymbolRef::Named(n) => self.symbols.get(&n),
+            SymbolRef::Section(s, i) => self.section_syms.get(&s).map(|s| &s[i]),
+        }
     }
 
     pub fn get_mut(&mut self, s: SymbolRef) -> Option<&mut Symbol<'p>> {
-        self.symbols.get_mut(&s.st_name)
+        match s {
+            SymbolRef::Named(n) => self.symbols.get_mut(&n),
+            SymbolRef::Section(s, i) => self.section_syms.get_mut(&s).map(|s| &mut s[i]),
+        }
     }
 
     pub fn sorted(&self) -> Vec<&Symbol<'p>> {
         let mut syms: Vec<&Symbol<'p>> = self.symbols.values().collect();
-        syms.sort_by(|s1, s2| sort_symbols_func(&s1, &s2));
+        syms.sort_by(|s1, s2| sort_symbols_func(s1, s2));
         syms
     }
 
@@ -190,7 +223,7 @@ impl<'p> SymbolTable<'p> {
         // should be 32 for elf32, but for now we only support 64 bit anyways
         let elfclass_bits = 64;
         // TODO: figure out a good numbers here
-        let bloom_size = 5;
+        let bloom_size = 8;
         let bloom_shift = 5;
         let nbuckets: u32 = symbols.len() as u32 / 2 + 1;
         // we always skip the first null symbol. For now, since we don't have
@@ -256,35 +289,29 @@ impl<'p> SymbolTable<'p> {
             data,
         )
     }
-}
 
-impl<'p> Deref for SymbolTable<'p> {
-    type Target = HashMap<u32, Symbol<'p>>;
-
-    fn deref(&self) -> &Self::Target {
+    pub fn named(&self) -> &HashMap<u32, Symbol<'_>> {
         &self.symbols
     }
 }
 
-fn st_type(st_info: u8) -> u8 {
-    st_info & 0xf
+impl<'s> Index<SymbolRef> for SymbolTable<'s> {
+    type Output = Symbol<'s>;
+
+    fn index(&self, index: SymbolRef) -> &Self::Output {
+        match index {
+            SymbolRef::Named(n) => &self.symbols[&n],
+            SymbolRef::Section(s, i) => &self.section_syms[&s][i],
+        }
+    }
 }
 
-fn st_bind(st_info: u8) -> u8 {
-    st_info >> 4
-}
-
-// local before global, notype before other types
+// local before global, then compare by gnu hash
 fn sort_symbols_func(s1: &Symbol, s2: &Symbol) -> Ordering {
-    let b1 = st_bind(s1.st_info);
-    let b2 = st_bind(s2.st_info);
-    let t1 = st_type(s1.st_info);
-    let t2 = st_type(s2.st_info);
+    let b1 = if s1.is_local() { 0 } else { 1 };
+    let b2 = if s2.is_local() { 0 } else { 1 };
     match b1.cmp(&b2) {
-        Ordering::Equal => match s1.gnu_hash().cmp(&s2.gnu_hash()) {
-            Ordering::Equal => t1.cmp(&t2),
-            c => c,
-        },
+        Ordering::Equal => s1.gnu_hash().cmp(&s2.gnu_hash()),
         c => c,
     }
 }
