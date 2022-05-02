@@ -13,6 +13,7 @@ use goblin::elf64::{
 use std::{
     cmp::Ordering,
     collections::HashMap,
+    convert::TryInto,
     fs::File,
     io::Write,
     mem::{align_of, size_of},
@@ -43,6 +44,11 @@ pub struct SectionRef {
     /// The chunk that the previous section resides in.
     chunk: usize,
 }
+
+const PLT_ENTRY_JMP_INSTR_SIZE: isize = 6;
+const PLT_ENTRY_PUSH_INSTR_SIZE: usize = 5;
+// The PLT header is just as big.
+const PLT_ENTRY_SIZE: usize = 16;
 
 #[derive(Clone, Copy, Debug)]
 pub enum DynTag {
@@ -471,6 +477,10 @@ impl<'d> Writer<'d> {
         self.sections[self.plt_section].sh_addr
     }
 
+    pub fn got_plt_address(&self) -> u64 {
+        self.sections[self.got_plt_section].sh_addr
+    }
+
     pub fn add_needed(&mut self, so_name: &str) {
         let entry = self.dyn_symbol_names.get_or_create(so_name.to_string());
         if entry.new {
@@ -494,17 +504,75 @@ impl<'d> Writer<'d> {
         section.add_chunk(data.into());
     }
 
-    fn patch_got_plt(&mut self) {
+    fn patch_plt_and_got_plt(&mut self) {
         use byteorder::{LittleEndian, WriteBytesExt};
 
         let plt_address = self.plt_address();
-        for (sym, addr) in &self.got_plt {
+        let got_plt_address = self.got_plt_address();
+        let relative_got_plt = got_plt_address as i64 - plt_address as i64;
+
+        // first we patch the header to point to the correct `.got.plt` entries
+        let plt_entry_chunk = self.sections[self.plt_section].chunk_mut(0);
+        // first address is `.got.plt[1]`
+        let got_entry_size = size_of::<u64>() as i64;
+        plt_entry_chunk[2..]
+            .as_mut()
+            .write_i32::<LittleEndian>(
+                (relative_got_plt + got_entry_size - PLT_ENTRY_JMP_INSTR_SIZE as i64)
+                    .try_into()
+                    .unwrap(),
+            )
+            .unwrap();
+        // the second address is `.got.plt[2]`
+        plt_entry_chunk[PLT_ENTRY_JMP_INSTR_SIZE as usize + 2..]
+            .as_mut()
+            .write_i32::<LittleEndian>(
+                (relative_got_plt + 2 * got_entry_size - 2 * PLT_ENTRY_JMP_INSTR_SIZE as i64)
+                    .try_into()
+                    .unwrap(),
+            )
+            .unwrap();
+
+        for (sym, offset) in &self.got_plt {
             let sym = self.symbols.get(*sym).unwrap();
-            // 16 to skip the header, another 16 for all entries before plt_index, and then another 11
-            let plt_index = sym.plt_index().unwrap();
-            self.sections[self.got_plt_section].chunk_mut(0)[*addr..]
+            let plt_entry_addr = plt_entry_addr(plt_address, sym.plt_index().unwrap());
+            // + `PLT_ENTRY_JMP_INSTR_SIZE` since initially we want to jump back past the `jmp`
+            // instruction of the plt entry
+            self.sections[self.got_plt_section].chunk_mut(0)[*offset..]
                 .as_mut()
-                .write_u64::<LittleEndian>(plt_address + 16 * (plt_index as u64 + 1) + 11)
+                .write_i64::<LittleEndian>(plt_entry_addr + PLT_ENTRY_JMP_INSTR_SIZE as i64)
+                .unwrap();
+
+            // we now patch multiple things of the PLT entry, such as:
+            //   1. the `jmp` instruction, which will point to a corresponding `.got.plt` entry
+            let plt_entry_offset = (plt_entry_addr as u64 - plt_address) as usize;
+            let got_plt_entry_addr = (*offset as u64 + got_plt_address) as isize;
+            let relative_got_plt_addr =
+                (got_plt_entry_addr - plt_entry_addr as isize - PLT_ENTRY_JMP_INSTR_SIZE)
+                    .try_into()
+                    .unwrap();
+            let plt_entry_chunk = self.sections[self.plt_section].chunk_mut(0);
+            plt_entry_chunk[plt_entry_offset + 2..]
+                .as_mut()
+                .write_i32::<LittleEndian>(relative_got_plt_addr)
+                .unwrap();
+
+            //   2. the "relocation offset" of the `push` instruction
+            //   TODO:
+            let relocation_offset = 0;
+            plt_entry_chunk[plt_entry_offset + PLT_ENTRY_JMP_INSTR_SIZE as usize + 1..]
+                .as_mut()
+                .write_u32::<LittleEndian>(relocation_offset)
+                .unwrap();
+
+            //   3. patch the last jmp instruction to point to the start of .plt
+            let plt0 = plt_address as i64 - (plt_entry_addr + PLT_ENTRY_SIZE as i64);
+            plt_entry_chunk[plt_entry_offset
+                + PLT_ENTRY_JMP_INSTR_SIZE as usize
+                + PLT_ENTRY_PUSH_INSTR_SIZE
+                + 1..]
+                .as_mut()
+                .write_i32::<LittleEndian>(plt0.try_into().unwrap())
                 .unwrap();
         }
     }
@@ -516,7 +584,7 @@ impl<'d> Writer<'d> {
             0xff, 0x25, 0x00, 0x00, 0x00, 0x00, // jmpq   *0x0(%rip)
             0x90, 0x90, 0x90, 0x90, // nop nop nop nop
         ];
-        plt_chunk.reserve((self.plt.len() + 1) * 16);
+        plt_chunk.reserve((self.plt.len() + 1) * PLT_ENTRY_SIZE);
         plt_chunk.extend(header);
 
         let entry = [
@@ -751,7 +819,7 @@ impl<'d> Writer<'d> {
 
         self.add_dyn_entries();
 
-        self.patch_got_plt();
+        self.patch_plt_and_got_plt();
     }
 
     fn handle_relocations(&mut self) {
@@ -998,4 +1066,9 @@ fn section_cmp(s1: &Section, s2: &Section) -> Ordering {
         Ordering::Equal => s1.sh_addralign.cmp(&s2.sh_addralign).reverse(),
         o => o,
     }
+}
+
+fn plt_entry_addr(base_addr: u64, index: usize) -> i64 {
+    let addr = base_addr + PLT_ENTRY_SIZE as u64 * (1 + index as u64);
+    addr.try_into().unwrap()
 }

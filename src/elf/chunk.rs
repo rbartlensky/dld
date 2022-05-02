@@ -5,7 +5,7 @@ use goblin::elf64::{
 };
 use std::{collections::HashSet, convert::TryInto, io::Write};
 
-use crate::elf::{SymbolRef, SymbolTable};
+use crate::elf::{plt_entry_addr, SymbolRef, SymbolTable};
 
 /// A part of a section.
 pub struct Chunk {
@@ -80,12 +80,6 @@ impl std::ops::DerefMut for Chunk {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.data
     }
-}
-
-fn plt_entry(base_addr: u64, index: usize) -> i64 {
-    // 16 to skip header, and 16 for each entry
-    let addr = base_addr + 16 * (1 + index as u64);
-    addr.try_into().unwrap()
 }
 
 fn apply_relocation(
@@ -196,7 +190,7 @@ fn apply_relocation(
             (&mut data[offset..]).write_i32::<LittleEndian>(value.try_into().unwrap()).unwrap();
         }
         R_X86_64_PLT32 => {
-            let l: i64 = plt_entry(plt_address, l.unwrap());
+            let l: i64 = plt_entry_addr(plt_address, l.unwrap());
             let value = l + a - p;
             (&mut data[offset..]).write_i32::<LittleEndian>(value.try_into().unwrap()).unwrap();
         }
