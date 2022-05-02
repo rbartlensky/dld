@@ -82,6 +82,12 @@ impl std::ops::DerefMut for Chunk {
     }
 }
 
+fn plt_entry(base_addr: u64, index: usize) -> i64 {
+    // 16 to skip header, and 16 for each entry
+    let addr = base_addr + 16 * (1 + index as u64);
+    addr.try_into().unwrap()
+}
+
 fn apply_relocation(
     chunk_address: u64,
     data: &mut [u8],
@@ -95,7 +101,7 @@ fn apply_relocation(
     let p: i64 = (chunk_address + rel.r_offset).try_into().unwrap();
     let _z = symbol.st_size;
     let got: i64 = got_address.try_into().unwrap();
-    let l: i64 = plt_address.try_into().unwrap();
+    let l = symbol.plt_index();
     let offset = rel.r_offset as usize;
     match (rel.r_info & 0xffff_ffff) as u32 {
         R_X86_64_NONE => {}
@@ -190,6 +196,7 @@ fn apply_relocation(
             (&mut data[offset..]).write_i32::<LittleEndian>(value.try_into().unwrap()).unwrap();
         }
         R_X86_64_PLT32 => {
+            let l: i64 = plt_entry(plt_address, l.unwrap());
             let value = l + a - p;
             (&mut data[offset..]).write_i32::<LittleEndian>(value.try_into().unwrap()).unwrap();
         }
