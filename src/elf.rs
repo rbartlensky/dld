@@ -601,9 +601,11 @@ impl<'d> Writer<'d> {
 
     fn handle_special_symbols(&mut self) {
         // TODO: handle more edge cases
+        let got_plt_addr = self.got_plt_address();
         if let Some(e) = self.symbol_names.get("_GLOBAL_OFFSET_TABLE_") {
             if let Some(s) = self.symbols.get_mut(SymbolRef::Named(e.offset as u32)) {
                 s.st_shndx = SHN_ABS as u16;
+                s.st_value = got_plt_addr;
             };
         }
         let symbols = &mut self.symbols;
