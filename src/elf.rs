@@ -2,7 +2,7 @@ use crate::{error::ErrorType, name::Name, serialize::Serialize, symbol::Symbol};
 use goblin::elf64::{
     header::{Header, ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64, ET_EXEC, EV_CURRENT},
     program_header::{ProgramHeader, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD},
-    reloc::{Rela, r_type, *},
+    reloc::{r_type, Rela, *},
     section_header::{
         SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, SHN_UNDEF, SHT_DYNAMIC,
         SHT_DYNSYM, SHT_FINI_ARRAY, SHT_GNU_HASH, SHT_HASH, SHT_INIT_ARRAY, SHT_PROGBITS, SHT_RELA,
@@ -57,9 +57,9 @@ pub enum DynTag {
     /// Name of needed library
     Needed = 1,
     /// Size in bytes of PLT relocs
-    Pltrelsz = 2,
+    PltRelSz = 2,
     /// Processor defined value
-    Pltgot = 3,
+    PltGot = 3,
     /// Address of symbol hash table
     Hash = 4,
     /// Address of string table
@@ -93,13 +93,13 @@ pub enum DynTag {
     /// Size of one Rel reloc
     Relent = 19,
     /// Type of reloc in PLT
-    Pltrel = 20,
+    PltRel = 20,
     /// For debugging, unspecified
     Debug = 21,
     /// Reloc might modify .text
     Textrel = 22,
     /// Address of PLT relocs
-    Jmprel = 23,
+    JmpRel = 23,
     /// Process relocations of object
     BindNow = 24,
     /// Array with addresses of init fct
@@ -129,6 +129,7 @@ pub struct Writer<'d> {
     dyn_symbol_names: StringTable,
     dyn_symbols: SymbolTable<'d>,
     dyn_rels: Vec<Rela>,
+    plt_rels: Vec<Rela>,
     sections: Vec<Section>,
     got_len: usize,
     plt: HashMap<SymbolRef, usize>,
@@ -147,6 +148,7 @@ pub struct Writer<'d> {
     got_plt_section: usize,
     dynamic_section: usize,
     dyn_rel_section: usize,
+    plt_rel_section: usize,
 }
 
 impl<'d> Writer<'d> {
@@ -239,6 +241,15 @@ impl<'d> Writer<'d> {
             ..Default::default()
         };
 
+        let plt_rel_sh = SectionHeader {
+            sh_name: section_names.get_or_create(".rela.plt").offset as u32,
+            sh_type: SHT_RELA,
+            sh_entsize: size_of::<Rela>() as u64,
+            sh_flags: SHF_ALLOC as u64,
+            sh_addralign: align_of::<u64>() as u64,
+            ..Default::default()
+        };
+
         Ok(Self {
             out,
             hash_style: options.hash_style,
@@ -249,6 +260,7 @@ impl<'d> Writer<'d> {
             symbols,
             dyn_symbols,
             dyn_rels: vec![],
+            plt_rels: vec![],
             sections: vec![
                 SectionHeader::default().into(),
                 section_names_sh.into(),
@@ -262,6 +274,7 @@ impl<'d> Writer<'d> {
                 dyn_symbols_sh.into(),
                 dynamic_sh.into(),
                 dyn_rel_sh.into(),
+                plt_rel_sh.into(),
             ],
             // first entry reserved
             got_len: 1,
@@ -283,6 +296,7 @@ impl<'d> Writer<'d> {
             dyn_sym_section: 9,
             dynamic_section: 10,
             dyn_rel_section: 11,
+            plt_rel_section: 12,
         })
     }
 
@@ -661,21 +675,25 @@ impl<'d> Writer<'d> {
         section.add_chunk(data.into());
         section.sh_link = self.dyn_sym_str_section as u32;
 
-        // populate dyn.rel section
-        let mut data = Vec::with_capacity(self.sections[self.dyn_rel_section].sh_size as usize);
+        // populate .rela.{dyn,plt} sections
         let got_addr = self.got_address();
-        let plt_addr = self.got_plt_address();
-        for dyn_rel in &mut self.dyn_rels {
-            match r_type(dyn_rel.r_info) {
-                R_X86_64_GLOB_DAT => dyn_rel.r_offset += got_addr,
-                R_X86_64_JUMP_SLOT => dyn_rel.r_offset += plt_addr,
-                _ => {}
+        let got_plt_addr = self.got_plt_address();
+        for (section_index, rels) in
+            [(self.dyn_rel_section, &mut self.dyn_rels), (self.plt_rel_section, &mut self.plt_rels)]
+        {
+            let mut data = Vec::with_capacity(self.sections[section_index].sh_size as usize);
+            for rel in rels {
+                match r_type(rel.r_info) {
+                    R_X86_64_GLOB_DAT => rel.r_offset += got_addr,
+                    R_X86_64_JUMP_SLOT => rel.r_offset += got_plt_addr,
+                    _ => {}
+                }
+                rel.serialize(&mut data);
             }
-            dyn_rel.serialize(&mut data);
+            let section = &mut self.sections[section_index];
+            section.add_chunk(data.into());
+            section.sh_link = self.dyn_sym_section as u32;
         }
-        let section = &mut self.sections[self.dyn_rel_section];
-        section.add_chunk(data.into());
-        section.sh_link = self.dyn_sym_section as u32;
     }
 
     fn sort_sections(&mut self) {
@@ -704,6 +722,8 @@ impl<'d> Writer<'d> {
                 self.dynamic_section = i;
             } else if sh_name == self.section_names.sh_name(".rela.dyn") {
                 self.dyn_rel_section = i;
+            } else if sh_name == self.section_names.sh_name(".rela.plt") {
+                self.plt_rel_section = i;
             }
         }
         for section in &mut self.sections {
@@ -806,17 +826,18 @@ impl<'d> Writer<'d> {
                 }
             };
             if let Some(offset) = sym.got_offset() {
-                // XXX: this should be more efficient
                 self.dyn_rels.push(rela(offset, index(), R_X86_64_GLOB_DAT));
             }
             if let Some(offset) = sym.got_plt_offset() {
-                sym.set_relocation_offset(self.dyn_rels.len());
-                self.dyn_rels.push(rela(offset, index(), R_X86_64_JUMP_SLOT));
+                sym.set_relocation_offset(self.plt_rels.len());
+                self.plt_rels.push(rela(offset, index(), R_X86_64_JUMP_SLOT));
             }
-
         }
         self.sections[self.dyn_rel_section].sh_size =
             (self.dyn_rels.len() * size_of::<Rela>()) as u64;
+
+        self.sections[self.plt_rel_section].sh_size =
+            (self.plt_rels.len() * size_of::<Rela>()) as u64;
 
         // calculate how many dyntags we have, so that we know how big our dynamic section is
         // + 1 for the null entry
@@ -982,11 +1003,7 @@ impl<'d> Writer<'d> {
 }
 
 const fn rela(offset: usize, index: usize, ty: u32) -> Rela {
-    Rela {
-        r_offset: offset as u64,
-        r_info: ((index << 32) + ty as usize) as u64,
-        r_addend: 0,
-    }
+    Rela { r_offset: offset as u64, r_info: ((index << 32) + ty as usize) as u64, r_addend: 0 }
 }
 
 const fn round_to(val: u64, multiple: u64) -> u64 {
@@ -1029,8 +1046,9 @@ fn get_load_program_header(
 fn dyn_entries(names: &StringTable, sh: &SectionHeader) -> usize {
     let name = names.name(sh.sh_name as usize).unwrap();
     match name as &str {
-        ".init" | ".fini" => 1,
+        ".init" | ".fini" | ".got.plt" => 1,
         ".rela.dyn" => 4,
+        ".rela.plt" => 3,
         _ => match sh.sh_type {
             SHT_DYNSYM | SHT_INIT_ARRAY | SHT_FINI_ARRAY => 2,
             SHT_STRTAB if sh.sh_flags & SHF_ALLOC as u64 == SHF_ALLOC as u64 => 2,
@@ -1045,14 +1063,18 @@ fn try_add_dyn_entries(entries: &mut Vec<(DynTag, u64)>, names: &StringTable, sh
     match name as &str {
         ".init" => entries.push((DynTag::Init, sh.sh_addr)),
         ".fini" => entries.push((DynTag::Fini, sh.sh_addr)),
-        ".rela.dyn" => {
-            entries.extend(&[
-                (DynTag::Rela, sh.sh_addr),
-                (DynTag::RelaEnt, sh.sh_entsize),
-                (DynTag::RelaSize, sh.sh_size),
-                (DynTag::RelaCount, 0),
-            ]);
-        }
+        ".rela.dyn" => entries.extend(&[
+            (DynTag::Rela, sh.sh_addr),
+            (DynTag::RelaEnt, sh.sh_entsize),
+            (DynTag::RelaSize, sh.sh_size),
+            (DynTag::RelaCount, 0),
+        ]),
+        ".rela.plt" => entries.extend(&[
+            (DynTag::JmpRel, sh.sh_addr),
+            (DynTag::PltRel, DynTag::Rela as u64),
+            (DynTag::PltRelSz, sh.sh_size),
+        ]),
+        ".got.plt" => entries.push((DynTag::PltGot, sh.sh_addr)),
         _ => match sh.sh_type {
             SHT_DYNSYM => {
                 entries.extend(&[(DynTag::SymTab, sh.sh_addr), (DynTag::SymEnt, sh.sh_entsize)])
