@@ -2,7 +2,7 @@ use crate::{error::ErrorType, name::Name, serialize::Serialize, symbol::Symbol};
 use goblin::elf64::{
     header::{Header, ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64, ET_EXEC, EV_CURRENT},
     program_header::{ProgramHeader, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD},
-    reloc::{Rela, *},
+    reloc::{Rela, r_type, *},
     section_header::{
         SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, SHN_UNDEF, SHT_DYNAMIC,
         SHT_DYNSYM, SHT_FINI_ARRAY, SHT_GNU_HASH, SHT_HASH, SHT_INIT_ARRAY, SHT_PROGBITS, SHT_RELA,
@@ -455,8 +455,8 @@ impl<'d> Writer<'d> {
         sym_ref: SymbolRef,
         section_ref: SectionRef,
     ) -> Result<(), ErrorType> {
-        let r_type = reloc.r_info as u32;
-        match r_type as u32 {
+        let r_type = r_type(reloc.r_info);
+        match r_type {
             R_X86_64_8 | R_X86_64_16 | R_X86_64_PC16 | R_X86_64_PC8 => {
                 return Err(ErrorType::Other(format!(
                     "Relocation {} not conforming to ABI.",
@@ -558,11 +558,10 @@ impl<'d> Writer<'d> {
                 .unwrap();
 
             //   2. the "relocation offset" of the `push` instruction
-            //   TODO:
-            let relocation_offset = 0;
+            let relocation_offset = sym.relocation_offset().unwrap();
             plt_entry_chunk[plt_entry_offset + PLT_ENTRY_JMP_INSTR_SIZE as usize + 1..]
                 .as_mut()
-                .write_u32::<LittleEndian>(relocation_offset)
+                .write_u32::<LittleEndian>(relocation_offset as u32)
                 .unwrap();
 
             //   3. patch the last jmp instruction to point to the start of .plt
@@ -663,8 +662,13 @@ impl<'d> Writer<'d> {
         // populate dyn.rel section
         let mut data = Vec::with_capacity(self.sections[self.dyn_rel_section].sh_size as usize);
         let got_addr = self.got_address();
+        let plt_addr = self.got_plt_address();
         for dyn_rel in &mut self.dyn_rels {
-            dyn_rel.r_offset += got_addr;
+            match r_type(dyn_rel.r_info) {
+                R_X86_64_GLOB_DAT => dyn_rel.r_offset += got_addr,
+                R_X86_64_JUMP_SLOT => dyn_rel.r_offset += plt_addr,
+                _ => {}
+            }
             dyn_rel.serialize(&mut data);
         }
         let section = &mut self.sections[self.dyn_rel_section];
@@ -782,22 +786,32 @@ impl<'d> Writer<'d> {
         self.sections[self.dyn_sym_str_section].sh_size = self.dyn_symbol_names.total_len() as u64;
 
         for (sym, dyn_sym) in
-            self.symbols.named().values().filter_map(|s| s.dynamic().map(|d| (s, d)))
+            self.symbols.named_mut().values_mut().filter_map(|s| s.dynamic().map(|d| (s, d)))
         {
+            let mut calculated_index = None;
+            let mut index = || {
+                if let Some(index) = calculated_index {
+                    index
+                } else {
+                    let index = sorted
+                        .iter()
+                        .enumerate()
+                        .find(|(_, s)| s.st_name == dyn_sym.st_name())
+                        .map(|(i, _)| i)
+                        .unwrap();
+                    calculated_index = Some(index);
+                    index
+                }
+            };
             if let Some(offset) = sym.got_offset() {
                 // XXX: this should be more efficient
-                let index = sorted
-                    .iter()
-                    .enumerate()
-                    .find(|(_, s)| s.st_name == dyn_sym.st_name())
-                    .map(|(i, _)| i)
-                    .unwrap();
-                self.dyn_rels.push(Rela {
-                    r_offset: offset as u64,
-                    r_info: ((index << 32) + R_X86_64_GLOB_DAT as usize) as u64,
-                    r_addend: 0,
-                });
+                self.dyn_rels.push(rela(offset, index(), R_X86_64_GLOB_DAT));
             }
+            if let Some(offset) = sym.got_plt_offset() {
+                sym.set_relocation_offset(self.dyn_rels.len());
+                self.dyn_rels.push(rela(offset, index(), R_X86_64_JUMP_SLOT));
+            }
+
         }
         self.sections[self.dyn_rel_section].sh_size =
             (self.dyn_rels.len() * size_of::<Rela>()) as u64;
@@ -962,6 +976,14 @@ impl<'d> Writer<'d> {
             try_add_dyn_entries(&mut self.dyn_entries, &self.section_names, sh);
         }
         self.dyn_entries.push((DynTag::Null, 0));
+    }
+}
+
+const fn rela(offset: usize, index: usize, ty: u32) -> Rela {
+    Rela {
+        r_offset: offset as u64,
+        r_info: ((index << 32) + ty as usize) as u64,
+        r_addend: 0,
     }
 }
 

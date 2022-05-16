@@ -19,6 +19,7 @@ pub struct Symbol<'r> {
     in_got: Option<usize>,
     in_plt: Option<usize>,
     in_got_plt: Option<usize>,
+    relocation_offset: Option<usize>,
     dynamic: Option<SymbolRef>,
 }
 
@@ -32,6 +33,7 @@ impl<'r> Symbol<'r> {
             in_got: None,
             in_plt: None,
             in_got_plt: None,
+            relocation_offset: None,
             dynamic: None,
         }
     }
@@ -111,6 +113,14 @@ impl<'r> Symbol<'r> {
 
     pub fn set_dynamic(&mut self, dynamic: SymbolRef) {
         self.dynamic = Some(dynamic);
+    }
+
+    pub fn relocation_offset(&self) -> Option<usize> {
+        self.relocation_offset
+    }
+
+    pub fn set_relocation_offset(&mut self, offset: usize) {
+        self.relocation_offset = Some(offset);
     }
 }
 

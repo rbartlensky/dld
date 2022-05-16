@@ -293,6 +293,10 @@ impl<'p> SymbolTable<'p> {
     pub fn named(&self) -> &HashMap<u32, Symbol<'_>> {
         &self.symbols
     }
+
+    pub fn named_mut(&mut self) -> &mut HashMap<u32, Symbol<'p>> {
+        &mut self.symbols
+    }
 }
 
 impl<'s> Index<SymbolRef> for SymbolTable<'s> {
