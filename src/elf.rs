@@ -628,23 +628,23 @@ impl<'d> Writer<'d> {
         let symbols = &mut self.symbols;
         for section in &mut self.sections {
             if section.sh_name == self.section_names.sh_name(".init_array") {
-                self.symbol_names.get("__init_array_start").map(|s| {
+                if let Some(s) = self.symbol_names.get("__init_array_start") {
                     section.chunk_mut(0).add_symbol(SymbolRef::Named(s.offset as u32));
-                });
-                self.symbol_names.get("__init_array_end").map(|s| {
+                }
+                if let Some(s) = self.symbol_names.get("__init_array_end") {
                     let sym_ref = SymbolRef::Named(s.offset as u32);
                     symbols.get_mut(sym_ref).unwrap().st_value = section.size_on_disk();
                     section.chunk_mut(section.last_chunk_index()).add_symbol(sym_ref);
-                });
+                }
             } else if section.sh_name == self.section_names.sh_name(".fini_array") {
-                self.symbol_names.get("__fini_array_start").map(|s| {
+                if let Some(s) = self.symbol_names.get("__fini_array_start") {
                     section.chunk_mut(0).add_symbol(SymbolRef::Named(s.offset as u32));
-                });
-                self.symbol_names.get("__fini_array_end").map(|s| {
+                }
+                if let Some(s) = self.symbol_names.get("__fini_array_end") {
                     let sym_ref = SymbolRef::Named(s.offset as u32);
                     symbols.get_mut(sym_ref).unwrap().st_value = section.size_on_disk();
                     section.chunk_mut(section.last_chunk_index()).add_symbol(sym_ref);
-                });
+                }
             }
         }
     }
@@ -844,12 +844,8 @@ impl<'d> Writer<'d> {
 
         // calculate how many dyntags we have, so that we know how big our dynamic section is
         // + 1 for the null entry
-        let extra_dyn_entries = self
-            .sections
-            .iter()
-            .map(|sh| dyn_entries(&self.section_names, sh))
-            .fold(0, |acc, f| acc + f)
-            + 1;
+        let extra_dyn_entries =
+            self.sections.iter().map(|sh| dyn_entries(&self.section_names, sh)).sum::<usize>() + 1;
         self.sections[self.dynamic_section].sh_size =
             ((self.dyn_entries.len() + extra_dyn_entries) * 2 * size_of::<u64>()) as u64;
 
@@ -937,7 +933,7 @@ impl<'d> Writer<'d> {
                 self.section_names.name(section.sh_name as usize)
             );
             for chunk in section.chunks() {
-                self.out.write_all(&chunk).unwrap();
+                self.out.write_all(chunk).unwrap();
             }
             offset += section.size_on_disk() as usize;
         }
@@ -946,7 +942,7 @@ impl<'d> Writer<'d> {
                 "0x{:x}: ---- section {} ----\n{:#?}",
                 offset,
                 i,
-                &section as &SectionHeader
+                section as &SectionHeader
             );
             offset += section.serialize(&mut self.out);
         }
@@ -1005,7 +1001,7 @@ impl<'d> Writer<'d> {
                     self.p_vaddr += sh.sh_size;
                 }
             }
-            if let Some(p_type) = p_type(&self.section_names, &sh) {
+            if let Some(p_type) = p_type(&self.section_names, sh) {
                 let write = if sh.sh_flags as u32 & SHF_WRITE == SHF_WRITE { PF_W } else { 0 };
                 // for .interp or .dynamic we have some extra program headers we want to generate
                 self.program_headers.insert(

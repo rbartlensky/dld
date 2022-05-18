@@ -62,8 +62,8 @@ pub struct ElfObject<'i, 'p, 'd, 'e> {
 }
 
 impl<'p, 'd> Input<'p, 'd> {
-    fn into_elf_object<'i>(&'i self) -> Result<Option<ElfObject<'i, 'p, '_, 'i>>, Error<'p>> {
-        let elf = Elf::parse(&self.data).map_path_err(self.path)?;
+    fn to_elf_object<'i>(&'i self) -> Result<Option<ElfObject<'i, 'p, '_, 'i>>, Error<'p>> {
+        let elf = Elf::parse(self.data).map_path_err(self.path)?;
         Ok(if elf.is_object_file() { Some(ElfObject::new(self, elf)) } else { None })
     }
 }
@@ -104,7 +104,7 @@ impl<'i, 'p, 'd, 'e> ElfObject<'i, 'p, 'd, 'e> {
         let path = &self.input.path;
         let elf = &self.elf;
         for symbol in &elf.syms {
-            let name = get_symbol_name(&elf, symbol.st_name).map_path_err(path)?;
+            let name = get_symbol_name(elf, symbol.st_name).map_path_err(path)?;
             let sec_ref = self.section_relocations.get(&(symbol.st_shndx as usize));
             let symbol_ref = writer
                 .add_symbol(symbol.into(), sec_ref.copied(), name, path)
@@ -203,7 +203,7 @@ impl Linker {
                 let object_data =
                     &data[(object.offset as usize)..(object.offset as usize + object.size())];
                 let input = Input { path, data: object_data };
-                let mut elf = input.into_elf_object()?.unwrap();
+                let mut elf = input.to_elf_object()?.unwrap();
                 elf.process_sections(writer)?;
                 elf.process_symbols(writer)?;
                 elf.process_relocations(writer)?;
@@ -229,7 +229,7 @@ impl Linker {
             .collect::<Result<Vec<Input>, Error<'_>>>()?;
         let mut elfs = Vec::with_capacity(inputs.len());
         for input in &inputs {
-            if let Some(mut elf) = input.into_elf_object()? {
+            if let Some(mut elf) = input.to_elf_object()? {
                 elf.process_sections(&mut writer)?;
                 elfs.push(elf);
             };

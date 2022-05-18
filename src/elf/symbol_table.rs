@@ -157,7 +157,7 @@ impl<'p> SymbolTable<'p> {
 
     pub fn sorted_mut(&mut self) -> Vec<&mut Symbol<'p>> {
         let mut syms: Vec<&mut Symbol<'p>> = self.symbols.values_mut().collect();
-        syms.sort_by(|s1, s2| sort_symbols_func(&s1, &s2));
+        syms.sort_by(|s1, s2| sort_symbols_func(s1, s2));
         syms
     }
 
@@ -165,7 +165,7 @@ impl<'p> SymbolTable<'p> {
     ///st_name, and we want to know its index in the final symbol table.
     pub fn sorted_with_indexes(&mut self) -> HashMap<u32, (usize, &mut Symbol<'p>)> {
         let mut syms: Vec<&mut Symbol<'p>> = self.symbols.values_mut().collect();
-        syms.sort_by(|s1, s2| sort_symbols_func(&s1, &s2));
+        syms.sort_by(|s1, s2| sort_symbols_func(s1, s2));
         syms.into_iter().enumerate().map(|(i, s)| (s.st_name, (i, s))).collect()
     }
 
