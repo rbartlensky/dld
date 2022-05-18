@@ -157,6 +157,12 @@ fn handle_linker_args(
                 app.inputs.push((path.into(), app.as_needed));
                 continue;
             }
+            "-z" => {
+                let _z = args
+                    .next()
+                    .ok_or_else(|| "Missing argument <KEYWORD> for '-z'.".to_string())?;
+                continue;
+            }
             "--as-needed" => {
                 app.as_needed = true;
                 continue;
