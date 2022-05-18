@@ -14,6 +14,7 @@ fn links() {
     for entry in std::fs::read_dir("./tests/c/").unwrap() {
         let entry = entry.unwrap();
         if entry.file_type().unwrap().is_file() {
+            println!("Linking {:?}", entry);
             link_with_clang(&dld_path, &entry.path());
             assert_eq!(Command::new("./test").status().unwrap().code().unwrap(), 0);
         }
