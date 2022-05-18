@@ -1,7 +1,7 @@
 use crate::{error::ErrorType, name::Name, serialize::Serialize, symbol::Symbol};
 use goblin::elf64::{
     header::{Header, ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64, ET_EXEC, EV_CURRENT},
-    program_header::{ProgramHeader, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD},
+    program_header::{ProgramHeader, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD, PT_PHDR},
     reloc::{r_type, Rela, *},
     section_header::{
         SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHN_ABS, SHN_UNDEF, SHT_DYNAMIC,
@@ -137,6 +137,7 @@ pub struct Writer<'d> {
     dyn_entries: Vec<(DynTag, u64)>,
     program_headers: Vec<ProgramHeader>,
     p_vaddr: u64,
+    start_p_vaddr: u64,
     file_offset: u64,
     shstr_section: usize,
     sym_str_section: usize,
@@ -169,11 +170,11 @@ impl<'d> Writer<'d> {
             e_ehsize: size_of::<Header>() as u16,
             e_phentsize: size_of::<ProgramHeader>() as u16,
             e_shentsize: size_of::<SectionHeader>() as u16,
+            e_phoff: size_of::<Header>() as u64,
             // patched in `Writer::write`
             e_entry: 0,
             e_phnum: 0,
             e_shnum: 0,
-            e_phoff: 0,
             e_shoff: 0,
             e_shstrndx: 0,
         };
@@ -283,7 +284,8 @@ impl<'d> Writer<'d> {
             dyn_entries: vec![(DynTag::Needed, interp_entry.offset as u64)],
             program_headers: vec![],
             p_vaddr: 0x200000,
-            file_offset: size_of::<Header>() as u64,
+            start_p_vaddr: 0x200000,
+            file_offset: 0,
             // XXX: I should really come up with a better way to store quick
             // references to these special sections
             shstr_section: 1,
@@ -874,11 +876,12 @@ impl<'d> Writer<'d> {
     }
 
     // elf header
+    // program header 1
+    // program header 2
     // section 1
     // section 2
     // section header 1
     // section header 2
-    // program header 1
     // ...
     pub fn compute_sections(&mut self) {
         self.assign_section_addresses();
@@ -896,15 +899,24 @@ impl<'d> Writer<'d> {
         self.eh.e_phnum = self.program_headers.len() as u16;
         self.eh.e_shstrndx = self.shstr_section as u16;
         self.eh.e_shoff = self.file_offset;
-        // the program header comes right after all the sections + headers
-        self.eh.e_phoff =
-            self.eh.e_shoff + (self.eh.e_shnum as usize * size_of::<SectionHeader>()) as u64;
+
+        // patch the PHDR program header now that we have computed everything
+        let ph = &mut self.program_headers[0];
+        ph.p_offset = self.eh.e_phoff;
+        ph.p_memsz = (self.eh.e_phnum * self.eh.e_phentsize) as u64;
+        ph.p_filesz = ph.p_memsz;
+        ph.p_vaddr = self.eh.e_phoff + self.start_p_vaddr;
+        ph.p_paddr = ph.p_vaddr;
     }
 
     pub fn write_to_disk(mut self) {
         let mut offset = 0;
         log::trace!("0x{:x}: ---- elf header ----\n{:#?}", offset, self.eh);
         offset += self.eh.serialize(&mut self.out);
+        for (i, ph) in self.program_headers.iter().enumerate() {
+            log::trace!("0x{:x}: ---- prog header {} ----\n{:#?}", offset, i, ph);
+            offset += ph.serialize(&mut self.out);
+        }
         for (i, section) in self.sections.iter().enumerate() {
             // add the necessary padding between aligned sections
             if offset < section.sh_offset as usize {
@@ -937,16 +949,30 @@ impl<'d> Writer<'d> {
             );
             offset += section.serialize(&mut self.out);
         }
-        for (i, ph) in self.program_headers.iter().enumerate() {
-            log::trace!("0x{:x}: ---- prog header {} ----\n{:#?}", offset, i, ph);
-            offset += ph.serialize(&mut self.out);
-        }
         let mut perm = self.out.metadata().unwrap().permissions();
         perm.set_mode(0o755);
         self.out.set_permissions(perm).unwrap();
     }
 
+    fn count_program_headers(&self) -> usize {
+        let mut count = 0;
+        let mut flags = 0;
+        for sh in self.sections.iter().skip(1) {
+            if sh.sh_flags != flags {
+                if sh.sh_flags as u32 & SHF_ALLOC == SHF_ALLOC {
+                    count += 1;
+                }
+                flags = sh.sh_flags;
+            }
+        }
+        // 3 == INTERP, DYNAMIC, PHDR
+        count + 3
+    }
+
     fn generate_program_headers(&mut self) {
+        let program_headers_size =
+            (self.count_program_headers() * self.eh.e_phentsize as usize) as u64;
+        let mut first_load_data = Some(program_headers_size + size_of::<Header>() as u64);
         let mut flags = 0;
         let mut program_header = None;
         for sh in self.sections.iter_mut().skip(1) {
@@ -959,8 +985,12 @@ impl<'d> Writer<'d> {
 
                 // this function deals with sh_offset for us. if we don't
                 // get a header, then we have to deal with it
-                program_header =
-                    get_load_program_header(sh, &mut self.file_offset, &mut self.p_vaddr);
+                program_header = get_load_program_header(
+                    sh,
+                    &mut self.file_offset,
+                    &mut self.p_vaddr,
+                    &mut first_load_data,
+                );
                 if program_header.is_none() {
                     sh.sh_offset = post_inc(&mut self.file_offset, sh.size_on_disk());
                 }
@@ -992,6 +1022,19 @@ impl<'d> Writer<'d> {
                 )
             }
         }
+        self.program_headers.insert(
+            0,
+            ProgramHeader {
+                p_type: PT_PHDR,
+                p_flags: PF_R,
+                p_offset: 0,
+                p_vaddr: 0,
+                p_paddr: 0,
+                p_filesz: 0,
+                p_memsz: 0,
+                p_align: align_of::<u64>() as u64,
+            },
+        );
     }
 
     fn add_dyn_entries(&mut self) {
@@ -1020,23 +1063,34 @@ fn get_load_program_header(
     sh: &mut Section,
     file_offset: &mut u64,
     p_vaddr: &mut u64,
+    extra_data: &mut Option<u64>,
 ) -> Option<ProgramHeader> {
     if sh.sh_flags as u32 & SHF_ALLOC == SHF_ALLOC {
+        let first_load = extra_data.is_some();
+        let extra_data = extra_data.take().unwrap_or_default();
         let write = if sh.sh_flags as u32 & SHF_WRITE == SHF_WRITE { PF_W } else { 0 };
         let exec = if sh.sh_flags as u32 & SHF_EXECINSTR == SHF_EXECINSTR { PF_X } else { 0 };
         *p_vaddr = round_to(*p_vaddr, PAGE_ALIGNMENT);
-        sh.set_address(*p_vaddr);
+        sh.set_address(*p_vaddr + extra_data);
         *file_offset = round_to(*file_offset, PAGE_ALIGNMENT);
-        sh.sh_offset = post_inc(file_offset, sh.size_on_disk());
+        let sh_size_on_disk = sh.size_on_disk() + extra_data;
+        sh.sh_offset = post_inc(file_offset, sh_size_on_disk);
+        let p_offset = if first_load {
+            sh.sh_offset += extra_data;
+            0
+        } else {
+            sh.sh_offset
+        };
+        let sh_size = sh.sh_size + extra_data;
         Some(ProgramHeader {
             p_type: PT_LOAD,
             p_flags: PF_R | write | exec,
             p_align: PAGE_ALIGNMENT,
-            p_offset: sh.sh_offset,
+            p_offset,
             p_vaddr: *p_vaddr,
-            p_paddr: post_inc(p_vaddr, sh.sh_size),
-            p_filesz: sh.size_on_disk(),
-            p_memsz: sh.sh_size,
+            p_paddr: post_inc(p_vaddr, sh_size),
+            p_filesz: sh_size_on_disk,
+            p_memsz: sh_size,
         })
     } else {
         None
@@ -1110,7 +1164,16 @@ fn post_inc(v: &mut u64, inc: u64) -> u64 {
 fn section_cmp(s1: &Section, s2: &Section) -> Ordering {
     match s1.sh_flags.cmp(&s2.sh_flags) {
         Ordering::Equal => s1.sh_addralign.cmp(&s2.sh_addralign).reverse(),
-        o => o,
+        // no flags should come last
+        o => {
+            if s1.sh_flags == 0 {
+                Ordering::Greater
+            } else if s2.sh_flags == 0 {
+                Ordering::Less
+            } else {
+                o
+            }
+        }
     }
 }
 
