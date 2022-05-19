@@ -9,12 +9,10 @@ where
     }
 }
 
+// I find a function more readable in this case
 pub fn is_some_with<T>(opt: Option<T>, v: &T) -> bool
 where
     T: std::cmp::PartialEq,
 {
-    match opt {
-        Some(inner) if &inner == v => true,
-        _ => false,
-    }
+    matches!(opt, Some(inner) if &inner == v)
 }
