@@ -3,6 +3,7 @@ pub mod elf;
 mod name;
 mod symbol;
 mod serialize;
+mod utils;
 
 use error::{Error, ErrorExt, ErrorType};
 use goblin::{

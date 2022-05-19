@@ -1,4 +1,10 @@
-use crate::{error::ErrorType, name::Name, serialize::Serialize, symbol::Symbol};
+use crate::{
+    error::ErrorType,
+    name::Name,
+    serialize::Serialize,
+    symbol::Symbol,
+    utils::{is_some_with, map_if_eq},
+};
 use goblin::elf64::{
     header::{Header, ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64, ET_EXEC, EV_CURRENT},
     program_header::{ProgramHeader, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD, PT_PHDR},
@@ -627,7 +633,7 @@ impl<'d> Writer<'d> {
         }
         let symbols = &mut self.symbols;
         for section in &mut self.sections {
-            if section.sh_name == self.section_names.sh_name(".init_array") {
+            if is_some_with(self.section_names.sh_name(".init_array"), &section.sh_name) {
                 if let Some(s) = self.symbol_names.get("__init_array_start") {
                     section.chunk_mut(0).add_symbol(SymbolRef::Named(s.offset as u32));
                 }
@@ -636,7 +642,7 @@ impl<'d> Writer<'d> {
                     symbols.get_mut(sym_ref).unwrap().st_value = section.size_on_disk();
                     section.chunk_mut(section.last_chunk_index()).add_symbol(sym_ref);
                 }
-            } else if section.sh_name == self.section_names.sh_name(".fini_array") {
+            } else if is_some_with(self.section_names.sh_name(".fini_array"), &section.sh_name) {
                 if let Some(s) = self.symbol_names.get("__fini_array_start") {
                     section.chunk_mut(0).add_symbol(SymbolRef::Named(s.offset as u32));
                 }
@@ -705,37 +711,33 @@ impl<'d> Writer<'d> {
         self.sections.insert(0, null_sect);
         for (i, section) in self.sections.iter().enumerate() {
             let sh_name = section.sh_name;
-            if sh_name == self.section_names.sh_name(".shstrtab") {
-                self.shstr_section = i;
-            } else if sh_name == self.section_names.sh_name(".strtab") {
-                self.sym_str_section = i;
-            } else if sh_name == self.section_names.sh_name(".dynstr") {
-                self.dyn_sym_str_section = i;
-            } else if sh_name == self.section_names.sh_name(".symtab") {
-                self.sym_section = i;
-            } else if sh_name == self.section_names.sh_name(".dynsym") {
-                self.dyn_sym_section = i;
-            } else if sh_name == self.section_names.sh_name(".got") {
-                self.got_section = i;
-            } else if sh_name == self.section_names.sh_name(".plt") {
-                self.plt_section = i;
-            } else if sh_name == self.section_names.sh_name(".got.plt") {
-                self.got_plt_section = i;
-            } else if sh_name == self.section_names.sh_name(".dynamic") {
-                self.dynamic_section = i;
-            } else if sh_name == self.section_names.sh_name(".rela.dyn") {
-                self.dyn_rel_section = i;
-            } else if sh_name == self.section_names.sh_name(".rela.plt") {
-                self.plt_rel_section = i;
+            for (index, section) in [
+                (&mut self.shstr_section, ".shstrtab"),
+                (&mut self.sym_str_section, ".strtab"),
+                (&mut self.dyn_sym_str_section, ".dynstr"),
+                (&mut self.sym_section, ".symtab"),
+                (&mut self.dyn_sym_section, ".dynsym"),
+                (&mut self.got_section, ".got"),
+                (&mut self.plt_section, ".plt"),
+                (&mut self.got_plt_section, ".got.plt"),
+                (&mut self.dynamic_section, ".dynamic"),
+                (&mut self.dyn_rel_section, ".rela.dyn"),
+                (&mut self.plt_rel_section, ".rela.plt"),
+            ] {
+                let res = map_if_eq(self.section_names.sh_name(section), &sh_name, |_| {
+                    *index = i;
+                });
+                if res.is_some() {
+                    break;
+                }
             }
         }
         for section in &mut self.sections {
             let sh_name = section.sh_name;
-            if sh_name == self.section_names.sh_name(".hash")
-            // || sh_name == self.section_names.sh_name(".gnu.hash")
-            {
-                section.sh_link = self.dyn_sym_section as u32;
-            }
+            let dyn_sym_section = self.dyn_sym_section as u32;
+            map_if_eq(self.section_names.sh_name(".hash"), &sh_name, |_| {
+                section.sh_link = dyn_sym_section;
+            });
         }
     }
 
