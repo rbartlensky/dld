@@ -202,7 +202,7 @@ impl<'d> Writer<'d> {
         let interp_entry = dyn_symbol_names.get_or_create(
             options.dynamic_linker.file_name().unwrap().to_str().unwrap().to_string(),
         );
-        let mut interp_section = Section::new(SectionHeader {
+        let mut interp_section = Section::from(SectionHeader {
             sh_name: section_names.get_or_create(".interp").offset as u32,
             sh_type: SHT_PROGBITS,
             sh_flags: SHF_ALLOC as u64,
@@ -332,7 +332,7 @@ impl<'d> Writer<'d> {
                 sh_addr: 0,
                 sh_offset: 0,
             };
-            let mut sh = Section::new(sh);
+            let mut sh = Section::from(sh);
             let ret = sh.add_chunk(Chunk::from(data.unwrap_or_default()));
             self.sections.push(sh);
             ret
@@ -732,7 +732,8 @@ impl<'d> Writer<'d> {
                 }
             }
         }
-        for section in &mut self.sections {
+        for (i, section) in self.sections.iter_mut().enumerate() {
+            section.set_index(i);
             let sh_name = section.sh_name;
             let dyn_sym_section = self.dyn_sym_section as u32;
             map_if_eq(self.section_names.sh_name(".hash"), &sh_name, |_| {

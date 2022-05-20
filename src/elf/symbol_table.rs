@@ -1,4 +1,4 @@
-use crate::elf::{Chunk, Symbol};
+use crate::elf::{Chunk, Section, Symbol};
 use crate::serialize::Serialize;
 
 use goblin::elf64::{
@@ -205,18 +205,17 @@ impl<'p> SymbolTable<'p> {
         }
         let mut data = Vec::with_capacity(nbuckets as usize + chains.len() + 2);
         HashTable::new(buckets, chains).serialize(&mut data);
-        super::Section::with_chunk(
-            SectionHeader {
-                sh_name,
-                sh_type: SHT_HASH,
-                sh_size: data.len() as u64,
-                sh_entsize: std::mem::size_of::<u32>() as u64,
-                sh_flags: SHF_ALLOC as u64,
-                sh_addralign: std::mem::align_of::<u32>() as u64,
-                ..Default::default()
-            },
-            data,
-        )
+        Section::builder(SectionHeader {
+            sh_name,
+            sh_type: SHT_HASH,
+            sh_size: data.len() as u64,
+            sh_entsize: std::mem::size_of::<u32>() as u64,
+            sh_flags: SHF_ALLOC as u64,
+            sh_addralign: std::mem::align_of::<u32>() as u64,
+            ..Default::default()
+        })
+        .with_chunk(data)
+        .build()
     }
 
     pub fn gnu_hash_section(sh_name: u32, symbols: &[&Symbol]) -> super::Section {
@@ -277,18 +276,17 @@ impl<'p> SymbolTable<'p> {
         };
         let mut data = Vec::with_capacity(ght.size());
         ght.serialize(&mut data);
-        super::Section::with_chunk(
-            SectionHeader {
-                sh_name,
-                sh_type: SHT_GNU_HASH,
-                sh_size: data.len() as u64,
-                sh_entsize: std::mem::size_of::<u32>() as u64,
-                sh_flags: SHF_ALLOC as u64,
-                sh_addralign: std::mem::align_of::<u32>() as u64,
-                ..Default::default()
-            },
-            data,
-        )
+        Section::builder(SectionHeader {
+            sh_name,
+            sh_type: SHT_GNU_HASH,
+            sh_size: data.len() as u64,
+            sh_entsize: std::mem::size_of::<u32>() as u64,
+            sh_flags: SHF_ALLOC as u64,
+            sh_addralign: std::mem::align_of::<u32>() as u64,
+            ..Default::default()
+        })
+        .with_chunk(data)
+        .build()
     }
 
     pub fn named(&self) -> &HashMap<u32, Symbol<'_>> {

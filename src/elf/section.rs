@@ -1,8 +1,45 @@
 use crate::elf::{chunk::Chunk, SymbolRef};
 
 use goblin::elf64::section_header::{SectionHeader, SHT_NOBITS};
+use std::sync::{Arc, RwLock};
+
+pub type SectionRef = Arc<RwLock<Section>>;
+
+pub trait Synthesized {}
+
+pub struct SectionBuilder {
+    section: Section,
+}
+
+impl SectionBuilder {
+    pub fn new(sh: SectionHeader) -> Self {
+        Self { section: Section { index: 0, link: None, synthetic: None, sh, chunks: vec![] } }
+    }
+
+    pub fn link(mut self, link: SectionRef) -> Self {
+        self.section.link = Some(link);
+        self
+    }
+
+    pub fn synthetic(mut self, s: Box<dyn Synthesized>) -> Self {
+        self.section.synthetic = Some(s);
+        self
+    }
+
+    pub fn with_chunk(mut self, data: Vec<u8>) -> Self {
+        self.section.chunks.push(data.into());
+        self
+    }
+
+    pub fn build(self) -> Section {
+        self.section
+    }
+}
 
 pub struct Section {
+    index: usize,
+    link: Option<SectionRef>,
+    synthetic: Option<Box<dyn Synthesized>>,
     /// The section header of the section.
     sh: SectionHeader,
     /// The data of the section.
@@ -10,12 +47,8 @@ pub struct Section {
 }
 
 impl Section {
-    pub fn new(sh: SectionHeader) -> Self {
-        Self { sh, chunks: vec![] }
-    }
-
-    pub fn with_chunk(sh: SectionHeader, data: Vec<u8>) -> Self {
-        Self { sh, chunks: vec![Chunk::from(data)] }
+    pub fn builder(sh: SectionHeader) -> SectionBuilder {
+        SectionBuilder::new(sh)
     }
 
     pub fn add_chunk(&mut self, chunk: Chunk) -> usize {
@@ -72,11 +105,15 @@ impl Section {
             base_addr += chunk.len() as u64;
         }
     }
+
+    pub fn set_index(&mut self, index: usize) {
+        self.index = index;
+    }
 }
 
 impl From<SectionHeader> for Section {
     fn from(other: SectionHeader) -> Self {
-        Self::new(other)
+        Self::builder(other).build()
     }
 }
 
