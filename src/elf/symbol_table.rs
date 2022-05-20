@@ -221,48 +221,49 @@ impl<'p> SymbolTable<'p> {
 
     pub fn gnu_hash_section(sh_name: u32, symbols: &[&Symbol]) -> super::Section {
         // should be 32 for elf32, but for now we only support 64 bit anyways
-        let elfclass_bits = 64;
-        // TODO: figure out a good numbers here
-        let bloom_size = 8;
-        let bloom_shift = 5;
-        let nbuckets: u32 = symbols.len() as u32 / 2 + 1;
+        let elfclass_bits: u32 = 64;
+        // mold allocates 12 bits for each symbol in the bloom filter, maybe we should as well
+        let bits = (symbols.len() as u32 - 1) * 12;
+        let bloom_size = (bits / elfclass_bits).next_power_of_two();
+        let bloom_shift = 26;
+        let nbuckets: u32 = symbols.len() as u32 / 8 + 1;
         // we always skip the first null symbol. For now, since we don't have
         // any locals in `.dynsym`, we can set this to 1, since we skip 1 symbol only.
         let symbol_offset = 1;
+        let symbols = &symbols[symbol_offset..];
 
         // create a bloom filter
         let mut bloom = vec![0_u64; bloom_size as usize];
-        for sym in &symbols[symbol_offset..] {
+        for sym in symbols {
             let hash = sym.gnu_hash();
-            let index = ((sym.gnu_hash() / elfclass_bits) % bloom_size) as usize;
-            bloom[index] |= 1_u64 << (hash % elfclass_bits);
-            bloom[index] |= 1_u64 << ((hash >> bloom_shift) % elfclass_bits);
+            calculate_bloom(&mut bloom, hash, elfclass_bits, bloom_shift);
         }
 
         // prepare the buckets
         let mut buckets = vec![0_u32; nbuckets as usize];
-        for (i, sym) in symbols.iter().enumerate().skip(symbol_offset) {
+        for (i, sym) in symbols.iter().enumerate() {
             let index = (sym.gnu_hash() % nbuckets) as usize;
             if buckets[index] == 0 {
-                buckets[index] = i as u32;
+                buckets[index] = (i + symbol_offset) as u32;
             }
         }
 
         // prepare the chains
         let mut chains = vec![0_u32; symbols.len()];
-        for (i, sym) in symbols.iter().enumerate().skip(symbol_offset) {
+        for (i, sym) in symbols.iter().enumerate() {
             // the last value in a chain doesn't have the last bit set, but
             // how do we know if this sym is the last in the chain?
             // since the symbols are sorted by gnu_hash, it means that if
             // this symbol's gnu_hash is different than the gnu_hash of the next symbol,
             // then there is no other symbol that has the same gnu_hash as our
             // current symbol
-            let value = if i == symbols.len() - 1 || sym.gnu_hash() != symbols[i + 1].gnu_hash() {
-                sym.gnu_hash() | 1
+            if i == symbols.len() - 1
+                || sym.gnu_hash() % nbuckets != symbols[i + 1].gnu_hash() % nbuckets
+            {
+                chains[i] = sym.gnu_hash() | 1;
             } else {
-                sym.gnu_hash() & !1
-            };
-            chains.push(value);
+                chains[i] = sym.gnu_hash() & !1;
+            }
         }
 
         let ght = GnuHashTable {
@@ -297,6 +298,12 @@ impl<'p> SymbolTable<'p> {
     pub fn named_mut(&mut self) -> &mut HashMap<u32, Symbol<'p>> {
         &mut self.symbols
     }
+}
+
+fn calculate_bloom(bloom: &mut [u64], hash: u32, elfclass_bits: u32, bloom_shift: u32) {
+    let index = ((hash / elfclass_bits) % bloom.len() as u32) as usize;
+    bloom[index] |= 1_u64 << (hash % elfclass_bits);
+    bloom[index] |= 1_u64 << ((hash >> bloom_shift) % elfclass_bits);
 }
 
 impl<'s> Index<SymbolRef> for SymbolTable<'s> {
@@ -345,7 +352,53 @@ pub struct GnuHashTable {
 
 impl GnuHashTable {
     pub fn size(&self) -> usize {
-        (self.nbuckets as usize + 4 + self.chains.len()) * size_of::<u32>()
-            + self.bloom_size as usize * size_of::<u64>()
+        // header + bloom + buckets + table
+        4 * size_of::<u32>()
+            + self.bloom.len() * size_of::<u64>()
+            + self.buckets.len() * size_of::<u32>()
+            + self.chains.len() * size_of::<u32>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::name::Name;
+    use goblin::elf64::sym::STT_FUNC;
+
+    use super::*;
+
+    fn create_symbol(st_name: u32) -> Sym {
+        Sym { st_name, st_info: STT_FUNC, ..Default::default() }
+    }
+
+    #[test]
+    fn gnu_hash_table() {
+        let (mut table, _) = SymbolTable::new(1, true);
+        let hash1 = Name::from("printf").elf_gnu_hash();
+        table.add_symbol(create_symbol(1), 0, hash1, Path::new("")).unwrap();
+        let hash2 = Name::from("__libc_start_main").elf_gnu_hash();
+        table.add_symbol(create_symbol(2), 0, hash2, Path::new("")).unwrap();
+        let sorted = table.sorted();
+        let section = SymbolTable::gnu_hash_section(0, &sorted[..]);
+        let mut expected_hash_table = GnuHashTable {
+            nbuckets: 1,
+            sym_offset: 1,
+            bloom_size: 1,
+            bloom_shift: 26,
+            bloom: vec![0],
+            buckets: vec![1],
+            chains: vec![hash1 & !1, hash2 | 1],
+        };
+        for hash in [hash1, hash2] {
+            calculate_bloom(
+                &mut expected_hash_table.bloom,
+                hash,
+                64,
+                expected_hash_table.bloom_shift,
+            );
+        }
+        let mut buf = Vec::with_capacity(expected_hash_table.size());
+        expected_hash_table.serialize(&mut buf);
+        assert_eq!(*section.chunks()[0], buf);
     }
 }

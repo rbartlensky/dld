@@ -738,6 +738,9 @@ impl<'d> Writer<'d> {
             map_if_eq(self.section_names.sh_name(".hash"), &sh_name, |_| {
                 section.sh_link = dyn_sym_section;
             });
+            map_if_eq(self.section_names.sh_name(".gnu.hash"), &sh_name, |_| {
+                section.sh_link = dyn_sym_section;
+            });
         }
     }
 
@@ -801,8 +804,7 @@ impl<'d> Writer<'d> {
             let sec = SymbolTable::hash_section(hash_name as u32, &sorted[..]);
             self.sections.push(sec);
         }
-        // TODO: not working
-        if self.hash_style == HashStyle::Gnu {
+        if self.hash_style == HashStyle::Gnu || self.hash_style == HashStyle::Both {
             let hash_name = self.section_names.get_or_create(".gnu.hash").offset;
             let sec = SymbolTable::gnu_hash_section(hash_name as u32, &sorted[..]);
             self.sections.push(sec);
