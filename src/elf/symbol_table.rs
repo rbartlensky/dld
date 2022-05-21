@@ -1,4 +1,4 @@
-use crate::elf::{Chunk, Section, Symbol};
+use crate::elf::{section::SectionPtr, Chunk, Section, Symbol};
 use crate::serialize::Serialize;
 
 use goblin::elf64::{
@@ -185,7 +185,7 @@ impl<'p> SymbolTable<'p> {
         self.num_locals
     }
 
-    pub fn hash_section(sh_name: u32, symbols: &[&Symbol]) -> super::Section {
+    pub fn hash_section(sh_name: u32, link: SectionPtr, symbols: &[&Symbol]) -> SectionPtr {
         let nbuckets: u32 = symbols.len() as u32 / 2 + 1;
         let mut buckets = vec![0; nbuckets as usize];
         let mut chains = vec![0_u32; symbols.len()];
@@ -215,10 +215,11 @@ impl<'p> SymbolTable<'p> {
             ..Default::default()
         })
         .with_chunk(data)
+        .link(link)
         .build()
     }
 
-    pub fn gnu_hash_section(sh_name: u32, symbols: &[&Symbol]) -> super::Section {
+    pub fn gnu_hash_section(sh_name: u32, link: SectionPtr, symbols: &[&Symbol]) -> SectionPtr {
         // should be 32 for elf32, but for now we only support 64 bit anyways
         let elfclass_bits: u32 = 64;
         // mold allocates 12 bits for each symbol in the bloom filter, maybe we should as well
@@ -286,6 +287,7 @@ impl<'p> SymbolTable<'p> {
             ..Default::default()
         })
         .with_chunk(data)
+        .link(link)
         .build()
     }
 
@@ -377,7 +379,8 @@ mod tests {
         let hash2 = Name::from("__libc_start_main").elf_gnu_hash();
         table.add_symbol(create_symbol(2), 0, hash2, Path::new("")).unwrap();
         let sorted = table.sorted();
-        let section = SymbolTable::gnu_hash_section(0, &sorted[..]);
+        let link_section = Section::new(Default::default());
+        let section = SymbolTable::gnu_hash_section(0, link_section, &sorted[..]);
         let mut expected_hash_table = GnuHashTable {
             nbuckets: 1,
             sym_offset: 1,
@@ -397,6 +400,6 @@ mod tests {
         }
         let mut buf = Vec::with_capacity(expected_hash_table.size());
         expected_hash_table.serialize(&mut buf);
-        assert_eq!(*section.chunks()[0], buf);
+        assert_eq!(*section.read().unwrap().chunks()[0], buf);
     }
 }

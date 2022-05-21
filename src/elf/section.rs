@@ -3,7 +3,7 @@ use crate::elf::{chunk::Chunk, SymbolRef};
 use goblin::elf64::section_header::{SectionHeader, SHT_NOBITS};
 use std::sync::{Arc, RwLock};
 
-pub type SectionRef = Arc<RwLock<Section>>;
+pub type SectionPtr = Arc<RwLock<Section>>;
 
 pub trait Synthesized {}
 
@@ -16,7 +16,7 @@ impl SectionBuilder {
         Self { section: Section { index: 0, link: None, synthetic: None, sh, chunks: vec![] } }
     }
 
-    pub fn link(mut self, link: SectionRef) -> Self {
+    pub fn link(mut self, link: SectionPtr) -> Self {
         self.section.link = Some(link);
         self
     }
@@ -31,14 +31,19 @@ impl SectionBuilder {
         self
     }
 
-    pub fn build(self) -> Section {
-        self.section
+    pub fn index(mut self, index: usize) -> Self {
+        self.section.index = index;
+        self
+    }
+
+    pub fn build(self) -> SectionPtr {
+        Arc::new(RwLock::new(self.section))
     }
 }
 
 pub struct Section {
     index: usize,
-    link: Option<SectionRef>,
+    link: Option<SectionPtr>,
     synthetic: Option<Box<dyn Synthesized>>,
     /// The section header of the section.
     sh: SectionHeader,
@@ -47,6 +52,10 @@ pub struct Section {
 }
 
 impl Section {
+    pub fn new(sh: SectionHeader) -> SectionPtr {
+        Self::builder(sh).build()
+    }
+
     pub fn builder(sh: SectionHeader) -> SectionBuilder {
         SectionBuilder::new(sh)
     }
@@ -89,8 +98,9 @@ impl Section {
         }
     }
 
-    pub fn patch_symbol_values(&mut self, sh_index: u16, table: &mut crate::elf::SymbolTable) {
+    pub fn patch_symbol_values(&mut self, table: &mut crate::elf::SymbolTable) {
         let mut base_addr = self.sh_addr;
+        let sh_index = self.index as u16;
         for chunk in &self.chunks {
             for symbol_ref in chunk.symbols().iter() {
                 if let Some(symbol) = table.get_mut(*symbol_ref) {
@@ -106,14 +116,21 @@ impl Section {
         }
     }
 
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
     pub fn set_index(&mut self, index: usize) {
         self.index = index;
     }
-}
 
-impl From<SectionHeader> for Section {
-    fn from(other: SectionHeader) -> Self {
-        Self::builder(other).build()
+    pub fn finalize(&mut self) {
+        let new_link = if let Some(link) = &self.link {
+            link.read().unwrap().index() as u32
+        } else {
+            return;
+        };
+        self.sh_link = new_link;
     }
 }
 

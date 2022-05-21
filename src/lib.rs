@@ -94,7 +94,7 @@ impl<'i, 'p, 'd, 'e> ElfObject<'i, 'p, 'd, 'e> {
                 i,
                 name,
                 self.input.path,
-                section_ref
+                section_ref,
             );
             self.section_relocations.insert(i, section_ref);
         }
@@ -108,7 +108,7 @@ impl<'i, 'p, 'd, 'e> ElfObject<'i, 'p, 'd, 'e> {
             let name = get_symbol_name(elf, symbol.st_name).map_path_err(path)?;
             let sec_ref = self.section_relocations.get(&(symbol.st_shndx as usize));
             let symbol_ref = writer
-                .add_symbol(symbol.into(), sec_ref.copied(), name, path)
+                .add_symbol(symbol.into(), sec_ref.cloned(), name, path)
                 .map_path_err(path)?;
             if let Some(sym) = symbol_ref {
                 self.symbols.insert(Symbol(symbol), sym);
@@ -123,7 +123,7 @@ impl<'i, 'p, 'd, 'e> ElfObject<'i, 'p, 'd, 'e> {
             for rel in rels.iter().filter(|r| r.r_sym != 0) {
                 let symbol = &elf.syms.get(rel.r_sym as usize).unwrap();
                 let index = if let Some(sec) = self.section_relocations.get(&(section_index - 1)) {
-                    *sec
+                    sec.clone()
                 } else {
                     continue;
                 };
