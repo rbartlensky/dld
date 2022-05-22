@@ -4,6 +4,8 @@ use crate::{name::Name, serialize::Serialize};
 
 use std::collections::HashMap;
 
+use super::section::Synthesized;
+
 #[derive(Debug)]
 pub struct Entry {
     pub index: usize,
@@ -16,33 +18,23 @@ pub struct StringTable {
     // name -> (index, offset)
     names: HashMap<Name, (usize, usize)>,
     total_len: usize,
+    section_strtab: Option<usize>,
 }
 
 impl Default for StringTable {
     fn default() -> Self {
-        let mut table = Self { names: Default::default(), total_len: 0 };
+        let mut table = Self { names: Default::default(), total_len: 0, section_strtab: None };
         table.get_or_create("");
         table
     }
 }
 
 impl StringTable {
-    pub fn with_name(name: impl Into<Name>) -> (Self, SectionHeader) {
+    pub fn with_name(name: impl Into<Name>) -> Self {
         let mut table = Self::default();
         let entry = table.get_or_create(name);
-        let sh = SectionHeader {
-            sh_name: entry.offset as u32,
-            sh_type: SHT_STRTAB,
-            sh_addralign: 1,
-            ..Default::default()
-        };
-        (table, sh)
-    }
-
-    pub fn new(sh_name: u32) -> (Self, SectionHeader) {
-        let sh =
-            SectionHeader { sh_name, sh_type: SHT_STRTAB, sh_addralign: 1, ..Default::default() };
-        (Self::default(), sh)
+        table.section_strtab = Some(entry.offset);
+        table
     }
 
     pub fn get_or_create(&mut self, name: impl Into<Name>) -> Entry {
@@ -96,5 +88,27 @@ impl StringTable {
             name.serialize(&mut data);
         }
         data.into()
+    }
+}
+
+impl Synthesized for StringTable {
+    fn fill_header(&self, sh: &mut SectionHeader) {
+        sh.sh_type = SHT_STRTAB;
+        sh.sh_addralign = 1;
+        if let Some(index) = &self.section_strtab {
+            sh.sh_name = *index as u32;
+        }
+    }
+
+    fn expand_data(&self, sh: &mut super::Section) {
+        sh.sh_size = self.total_len as u64;
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }

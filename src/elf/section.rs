@@ -1,10 +1,8 @@
 use crate::elf::{chunk::Chunk, SymbolRef};
 
 use goblin::elf64::section_header::{SectionHeader, SHT_NOBITS};
-use std::{
-    any::Any,
-    sync::{Arc, RwLock},
-};
+use parking_lot::RwLock;
+use std::{any::Any, sync::Arc};
 
 pub type SectionPtr = Arc<RwLock<Section>>;
 
@@ -13,7 +11,9 @@ pub trait Synthesized {
 
     fn expand_data(&self, sh: &mut Section);
 
-    fn as_any(&mut self) -> &mut dyn Any;
+    fn as_any(&self) -> &dyn Any;
+
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 pub struct SectionBuilder {
@@ -30,9 +30,9 @@ impl SectionBuilder {
         self
     }
 
-    pub fn synthetic(mut self, s: Box<dyn Synthesized>) -> Self {
+    pub fn synthetic<T: Synthesized + 'static>(mut self, s: T) -> Self {
         s.fill_header(&mut self.section);
-        self.section.synthetic = Some(s);
+        self.section.synthetic = Some(Box::new(s));
         self
     }
 
@@ -55,7 +55,7 @@ pub struct Section {
     index: usize,
     link: Option<SectionPtr>,
     // TODO: find a more ergonomic way to represent this, without introducing
-    // generic parameters
+    // generic parameters, or boxing
     synthetic: Option<Box<dyn Synthesized>>,
     /// The section header of the section.
     sh: SectionHeader,
@@ -136,9 +136,17 @@ impl Section {
         self.index = index;
     }
 
-    pub fn inner<T: Synthesized + 'static>(&mut self) -> Option<&mut T> {
+    pub fn inner<T: Synthesized + 'static>(&self) -> Option<&T> {
+        if let Some(s) = &self.synthetic {
+            s.as_any().downcast_ref()
+        } else {
+            None
+        }
+    }
+
+    pub fn inner_mut<T: Synthesized + 'static>(&mut self) -> Option<&mut T> {
         if let Some(s) = &mut self.synthetic {
-            s.as_mut().as_any().downcast_mut()
+            s.as_any_mut().downcast_mut()
         } else {
             None
         }
@@ -153,7 +161,7 @@ impl Section {
 
     pub fn finalize(&mut self) {
         let new_link = if let Some(link) = &self.link {
-            link.read().unwrap().index() as u32
+            link.read().index() as u32
         } else {
             return;
         };

@@ -163,7 +163,11 @@ impl Linker {
             let data = read(path).map_path_err(path)?;
             let elf = Elf::parse(&data).unwrap();
             for entry in undefines.iter_mut().filter(|(_, v)| !**v) {
-                let name = writer.symbol_name(*entry.0).to_string();
+                let name = if let Some(name) = writer.symbol_name(*entry.0) {
+                    name.to_string()
+                } else {
+                    continue;
+                };
                 for sym in &elf.dynsyms {
                     let inner_name = get_dyn_symbol_name(&elf, sym.st_name).map_path_err(path)?;
                     if name == inner_name {
@@ -193,8 +197,12 @@ impl Linker {
             let ar = Archive::parse(&data).map_path_err(path)?;
             let mut members = HashSet::new();
             for entry in &mut undefines {
-                let name = writer.symbol_name(*entry.0);
-                if let Some(member) = ar.member_of_symbol(name) {
+                let name = if let Some(name) = writer.symbol_name(*entry.0) {
+                    name
+                } else {
+                    continue;
+                };
+                if let Some(member) = ar.member_of_symbol(&*name) {
                     *entry.1 = true;
                     members.insert(member);
                 }
@@ -247,8 +255,10 @@ impl Linker {
         writer.compute_sections();
         let undefined = writer.undefined_symbols();
         if !undefined.is_empty() {
-            let names =
-                undefined.iter().map(|u| writer.symbol_name(*u).to_string()).collect::<Vec<_>>();
+            let names = undefined
+                .iter()
+                .filter_map(|u| writer.symbol_name(*u).map(|s| s.to_string()))
+                .collect::<Vec<_>>();
             return Err(ErrorType::Other(format_list(&names)))
                 .map_path_err(self.options.output.as_path());
         }

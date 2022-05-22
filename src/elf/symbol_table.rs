@@ -400,6 +400,6 @@ mod tests {
         }
         let mut buf = Vec::with_capacity(expected_hash_table.size());
         expected_hash_table.serialize(&mut buf);
-        assert_eq!(*section.read().unwrap().chunks()[0], buf);
+        assert_eq!(*section.read().chunks()[0], buf);
     }
 }
