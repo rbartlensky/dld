@@ -1,11 +1,20 @@
 use crate::elf::{chunk::Chunk, SymbolRef};
 
 use goblin::elf64::section_header::{SectionHeader, SHT_NOBITS};
-use std::sync::{Arc, RwLock};
+use std::{
+    any::Any,
+    sync::{Arc, RwLock},
+};
 
 pub type SectionPtr = Arc<RwLock<Section>>;
 
-pub trait Synthesized {}
+pub trait Synthesized {
+    fn fill_header(&self, sh: &mut SectionHeader);
+
+    fn expand_data(&self, sh: &mut Section);
+
+    fn as_any(&mut self) -> &mut dyn Any;
+}
 
 pub struct SectionBuilder {
     section: Section,
@@ -22,6 +31,7 @@ impl SectionBuilder {
     }
 
     pub fn synthetic(mut self, s: Box<dyn Synthesized>) -> Self {
+        s.fill_header(&mut self.section);
         self.section.synthetic = Some(s);
         self
     }
@@ -44,6 +54,8 @@ impl SectionBuilder {
 pub struct Section {
     index: usize,
     link: Option<SectionPtr>,
+    // TODO: find a more ergonomic way to represent this, without introducing
+    // generic parameters
     synthetic: Option<Box<dyn Synthesized>>,
     /// The section header of the section.
     sh: SectionHeader,
@@ -122,6 +134,21 @@ impl Section {
 
     pub fn set_index(&mut self, index: usize) {
         self.index = index;
+    }
+
+    pub fn inner<T: Synthesized + 'static>(&mut self) -> Option<&mut T> {
+        if let Some(s) = &mut self.synthetic {
+            s.as_mut().as_any().downcast_mut()
+        } else {
+            None
+        }
+    }
+
+    pub fn expand_data(&mut self) {
+        if let Some(inner) = self.synthetic.take() {
+            inner.expand_data(self);
+            self.synthetic = Some(inner);
+        }
     }
 
     pub fn finalize(&mut self) {

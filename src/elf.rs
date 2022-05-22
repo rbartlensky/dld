@@ -29,6 +29,7 @@ pub use options::*;
 
 mod section;
 pub use section::{Section, SectionPtr};
+mod plt;
 
 mod chunk;
 
@@ -144,7 +145,6 @@ pub struct Writer<'d> {
     plt_rels: Vec<Rela>,
     sections: Vec<SectionPtr>,
     got_len: usize,
-    plt: HashMap<SymbolRef, usize>,
     got_plt: HashMap<SymbolRef, usize>,
     dyn_entries: Vec<(DynTag, u64)>,
     program_headers: Vec<ProgramHeader>,
@@ -229,7 +229,6 @@ impl<'d> Writer<'d> {
         let mut got_plt_sh = section;
         got_plt_sh.sh_name = section_names.get_or_create(".got.plt").offset as u32;
         let mut plt_sh = section;
-        plt_sh.sh_flags = (SHF_ALLOC | SHF_EXECINSTR) as u64;
         plt_sh.sh_name = section_names.get_or_create(".plt").offset as u32;
 
         let (symbols, symbols_sh) =
@@ -270,7 +269,7 @@ impl<'d> Writer<'d> {
         let dyn_sym_str_section = Section::new(dyn_symbol_names_sh);
         let got_section = Section::new(got_sh);
         let got_plt_section = Section::new(got_plt_sh);
-        let plt_section = Section::new(plt_sh);
+        let plt_section = Section::builder(plt_sh).synthetic(Box::new(plt::Plt::new())).build();
         let sym_section = Section::builder(symbols_sh).link(Arc::clone(&sym_str_section)).build();
         let dyn_sym_section =
             Section::builder(dyn_symbols_sh).link(Arc::clone(&dyn_sym_str_section)).build();
@@ -311,7 +310,6 @@ impl<'d> Writer<'d> {
             sections,
             // first entry reserved
             got_len: 1,
-            plt: Default::default(),
             got_plt: Default::default(),
             dyn_entries: vec![(DynTag::Needed, interp_entry.offset as u64)],
             program_headers: vec![],
@@ -614,29 +612,6 @@ impl<'d> Writer<'d> {
         }
     }
 
-    fn resize_plt_section(&mut self) {
-        let mut plt_chunk = vec![];
-        let header = [
-            0xff, 0x35, 0x00, 0x00, 0x00, 0x00, // pushq  0x0(%rip)
-            0xff, 0x25, 0x00, 0x00, 0x00, 0x00, // jmpq   *0x0(%rip)
-            0x90, 0x90, 0x90, 0x90, // nop nop nop nop
-        ];
-        plt_chunk.reserve((self.plt.len() + 1) * PLT_ENTRY_SIZE);
-        plt_chunk.extend(header);
-
-        let entry = [
-            0xff, 0x25, 0x00, 0x00, 0x00, 0x00, // jmpq   *0x0(%rip)
-            0x68, 0x00, 0x00, 0x00, 0x00, // push   $0x00000000
-            0xe9, 0x00, 0x00, 0x00, 0x00, // jmpq   0x0
-        ];
-        for _ in 0..self.plt.len() {
-            plt_chunk.extend(&entry);
-        }
-        let mut section = self.plt_section.write().unwrap();
-        section.sh_size = plt_chunk.len() as u64;
-        section.add_chunk(plt_chunk.into());
-    }
-
     fn handle_special_symbols(&mut self) {
         // TODO: handle more edge cases
         let got_plt_addr = self.got_plt_address();
@@ -753,14 +728,17 @@ impl<'d> Writer<'d> {
                         R_X86_64_PLT32 => {
                             let sym = self.symbols.get_mut(*sym_ref).unwrap();
                             if sym.dynamic().is_some() {
-                                let len = self.plt.len();
-                                let index = *self.plt.entry(*sym_ref).or_insert(len);
                                 let len = self.got_plt.len() + 3;
-                                let offset = dbg!(*self
-                                    .got_plt
-                                    .entry(*sym_ref)
-                                    .or_insert(len * size_of::<u64>()));
+                                let offset =
+                                    *self.got_plt.entry(*sym_ref).or_insert(len * size_of::<u64>());
                                 sym.set_got_plt_offset(offset);
+                                let index = self
+                                    .plt_section
+                                    .write()
+                                    .unwrap()
+                                    .inner::<plt::Plt>()
+                                    .unwrap()
+                                    .insert(*sym_ref);
                                 sym.set_plt_index(index);
                             } else {
                                 // replace PLT32 with PC32 since the symbol is local to us
@@ -780,7 +758,9 @@ impl<'d> Writer<'d> {
 
         self.resize_got_section();
         self.resize_got_plt_section();
-        self.resize_plt_section();
+        for s in &self.sections {
+            s.write().unwrap().expand_data();
+        }
 
         self.sym_section.write().unwrap().sh_size = self.symbols.total_len() as u64;
         self.dyn_sym_section.write().unwrap().sh_size = self.dyn_symbols.total_len() as u64;
