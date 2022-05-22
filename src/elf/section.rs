@@ -1,4 +1,10 @@
-use crate::elf::{chunk::Chunk, plt::Plt, string_table::StringTable, SymbolRef};
+use crate::elf::{
+    chunk::Chunk,
+    plt::Plt,
+    string_table::StringTable,
+    symbol_table::{GnuHashTable, HashTable},
+    SymbolRef,
+};
 
 use goblin::elf64::section_header::{SectionHeader, SHT_NOBITS};
 use parking_lot::RwLock;
@@ -55,6 +61,8 @@ impl SectionBuilder {
 pub enum SynthesizedKind {
     Plt(Plt),
     StringTable(StringTable),
+    Hash(HashTable),
+    GnuHash(GnuHashTable),
 }
 
 impl From<Plt> for SynthesizedKind {
@@ -69,11 +77,25 @@ impl From<StringTable> for SynthesizedKind {
     }
 }
 
+impl From<HashTable> for SynthesizedKind {
+    fn from(p: HashTable) -> Self {
+        Self::Hash(p)
+    }
+}
+
+impl From<GnuHashTable> for SynthesizedKind {
+    fn from(p: GnuHashTable) -> Self {
+        Self::GnuHash(p)
+    }
+}
+
 impl SynthesizedKind {
     fn as_inner(&self) -> &dyn Synthesized {
         match self {
             Self::Plt(p) => p,
             Self::StringTable(s) => s,
+            Self::Hash(h) => h,
+            Self::GnuHash(h) => h,
         }
     }
 
@@ -81,6 +103,8 @@ impl SynthesizedKind {
         match self {
             Self::Plt(p) => p,
             Self::StringTable(s) => s,
+            Self::Hash(h) => h,
+            Self::GnuHash(h) => h,
         }
     }
 }

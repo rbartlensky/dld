@@ -116,7 +116,7 @@ impl<W: Write> Serialize<W> for crate::elf::HashTable {
         for v in self.buckets.iter().chain(self.chains.iter()) {
             buf.write_u32::<LittleEndian>(*v).unwrap();
         }
-        size_of::<u32>() * (self.nbuckets as usize + self.nchains as usize + 2)
+        self.size()
     }
 }
 

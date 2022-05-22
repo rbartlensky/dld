@@ -1,4 +1,4 @@
-use crate::elf::{section::SectionPtr, Chunk, Section, Symbol};
+use crate::elf::{Chunk, Section, Symbol};
 use crate::serialize::Serialize;
 
 use goblin::elf64::{
@@ -15,6 +15,8 @@ use std::{
     path::{Path, PathBuf},
 };
 use thiserror::Error;
+
+use super::section::Synthesized;
 
 /// A symbol can be fetched by indexing `symbols` in the following way: `symbols[st_name]`.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -185,7 +187,60 @@ impl<'p> SymbolTable<'p> {
         self.num_locals
     }
 
-    pub fn hash_section(sh_name: u32, link: SectionPtr, symbols: &[&Symbol]) -> SectionPtr {
+    pub fn named(&self) -> &HashMap<u32, Symbol<'_>> {
+        &self.symbols
+    }
+
+    pub fn named_mut(&mut self) -> &mut HashMap<u32, Symbol<'p>> {
+        &mut self.symbols
+    }
+}
+
+fn calculate_bloom(bloom: &mut [u64], hash: u32, elfclass_bits: u32, bloom_shift: u32) {
+    let index = ((hash / elfclass_bits) % bloom.len() as u32) as usize;
+    bloom[index] |= 1_u64 << (hash % elfclass_bits);
+    bloom[index] |= 1_u64 << ((hash >> bloom_shift) % elfclass_bits);
+}
+
+impl<'s> Index<SymbolRef> for SymbolTable<'s> {
+    type Output = Symbol<'s>;
+
+    fn index(&self, index: SymbolRef) -> &Self::Output {
+        match index {
+            SymbolRef::Named(n) => &self.symbols[&n],
+            SymbolRef::Section(s, i) => &self.section_syms[&s][i],
+        }
+    }
+}
+
+// local before global, then compare by gnu hash
+fn sort_symbols_func(s1: &Symbol, s2: &Symbol) -> Ordering {
+    let b1 = if s1.is_local() { 0 } else { 1 };
+    let b2 = if s2.is_local() { 0 } else { 1 };
+    match b1.cmp(&b2) {
+        Ordering::Equal => s1.gnu_hash().cmp(&s2.gnu_hash()),
+        c => c,
+    }
+}
+
+#[derive(Default)]
+pub struct HashTable {
+    pub nbuckets: u32,
+    pub nchains: u32,
+    pub buckets: Vec<u32>,
+    pub chains: Vec<u32>,
+}
+
+impl HashTable {
+    fn new(buckets: Vec<u32>, chains: Vec<u32>) -> Self {
+        Self { nbuckets: buckets.len() as u32, nchains: chains.len() as u32, buckets, chains }
+    }
+
+    pub fn size(&self) -> usize {
+        size_of::<u32>() * (self.nbuckets as usize + self.nchains as usize + 2)
+    }
+
+    pub fn add_symbols(&mut self, symbols: &[&Symbol]) {
         let nbuckets: u32 = symbols.len() as u32 / 2 + 1;
         let mut buckets = vec![0; nbuckets as usize];
         let mut chains = vec![0_u32; symbols.len()];
@@ -203,23 +258,59 @@ impl<'p> SymbolTable<'p> {
                 chains[chain_index] = symbol_index as u32;
             }
         }
-        let mut data = Vec::with_capacity(nbuckets as usize + chains.len() + 2);
-        HashTable::new(buckets, chains).serialize(&mut data);
-        Section::builder(SectionHeader {
-            sh_name,
+        *self = Self::new(buckets, chains);
+    }
+}
+
+impl Synthesized for HashTable {
+    fn fill_header(&self, sh: &mut SectionHeader) {
+        *sh = SectionHeader {
             sh_type: SHT_HASH,
-            sh_size: data.len() as u64,
             sh_entsize: std::mem::size_of::<u32>() as u64,
             sh_flags: SHF_ALLOC as u64,
             sh_addralign: std::mem::align_of::<u32>() as u64,
-            ..Default::default()
-        })
-        .with_chunk(data)
-        .link(link)
-        .build()
+
+            ..*sh
+        }
     }
 
-    pub fn gnu_hash_section(sh_name: u32, link: SectionPtr, symbols: &[&Symbol]) -> SectionPtr {
+    fn expand_data(&self, sh: &mut Section) {
+        let mut data = Vec::with_capacity(self.size());
+        self.serialize(&mut data);
+        sh.sh_size = data.len() as u64;
+        sh.add_chunk(data.into());
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct GnuHashTable {
+    pub nbuckets: u32,
+    pub buckets: Vec<u32>,
+    pub sym_offset: u32,
+    pub bloom_size: u32,
+    pub bloom_shift: u32,
+    pub bloom: Vec<u64>,
+    pub chains: Vec<u32>,
+}
+
+impl GnuHashTable {
+    pub fn size(&self) -> usize {
+        // header + bloom + buckets + table
+        4 * size_of::<u32>()
+            + self.bloom.len() * size_of::<u64>()
+            + self.buckets.len() * size_of::<u32>()
+            + self.chains.len() * size_of::<u32>()
+    }
+
+    pub fn add_symbols(&mut self, symbols: &[&Symbol]) {
         // should be 32 for elf32, but for now we only support 64 bit anyways
         let elfclass_bits: u32 = 64;
         // mold allocates 12 bits for each symbol in the bloom filter, maybe we should as well
@@ -266,7 +357,7 @@ impl<'p> SymbolTable<'p> {
             }
         }
 
-        let ght = GnuHashTable {
+        *self = GnuHashTable {
             nbuckets,
             buckets,
             sym_offset: symbol_offset as u32,
@@ -275,88 +366,33 @@ impl<'p> SymbolTable<'p> {
             bloom,
             chains,
         };
-        let mut data = Vec::with_capacity(ght.size());
-        ght.serialize(&mut data);
-        Section::builder(SectionHeader {
-            sh_name,
+    }
+}
+
+impl Synthesized for GnuHashTable {
+    fn fill_header(&self, sh: &mut SectionHeader) {
+        *sh = SectionHeader {
             sh_type: SHT_GNU_HASH,
-            sh_size: data.len() as u64,
             sh_entsize: std::mem::size_of::<u32>() as u64,
             sh_flags: SHF_ALLOC as u64,
             sh_addralign: std::mem::align_of::<u32>() as u64,
-            ..Default::default()
-        })
-        .with_chunk(data)
-        .link(link)
-        .build()
-    }
-
-    pub fn named(&self) -> &HashMap<u32, Symbol<'_>> {
-        &self.symbols
-    }
-
-    pub fn named_mut(&mut self) -> &mut HashMap<u32, Symbol<'p>> {
-        &mut self.symbols
-    }
-}
-
-fn calculate_bloom(bloom: &mut [u64], hash: u32, elfclass_bits: u32, bloom_shift: u32) {
-    let index = ((hash / elfclass_bits) % bloom.len() as u32) as usize;
-    bloom[index] |= 1_u64 << (hash % elfclass_bits);
-    bloom[index] |= 1_u64 << ((hash >> bloom_shift) % elfclass_bits);
-}
-
-impl<'s> Index<SymbolRef> for SymbolTable<'s> {
-    type Output = Symbol<'s>;
-
-    fn index(&self, index: SymbolRef) -> &Self::Output {
-        match index {
-            SymbolRef::Named(n) => &self.symbols[&n],
-            SymbolRef::Section(s, i) => &self.section_syms[&s][i],
+            ..*sh
         }
     }
-}
 
-// local before global, then compare by gnu hash
-fn sort_symbols_func(s1: &Symbol, s2: &Symbol) -> Ordering {
-    let b1 = if s1.is_local() { 0 } else { 1 };
-    let b2 = if s2.is_local() { 0 } else { 1 };
-    match b1.cmp(&b2) {
-        Ordering::Equal => s1.gnu_hash().cmp(&s2.gnu_hash()),
-        c => c,
+    fn expand_data(&self, sh: &mut Section) {
+        let mut data = Vec::with_capacity(self.size());
+        self.serialize(&mut data);
+        sh.sh_size = data.len() as u64;
+        sh.add_chunk(data.into());
     }
-}
 
-pub struct HashTable {
-    pub nbuckets: u32,
-    pub nchains: u32,
-    pub buckets: Vec<u32>,
-    pub chains: Vec<u32>,
-}
-
-impl HashTable {
-    pub fn new(buckets: Vec<u32>, chains: Vec<u32>) -> Self {
-        Self { nbuckets: buckets.len() as u32, nchains: chains.len() as u32, buckets, chains }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
-}
 
-pub struct GnuHashTable {
-    pub nbuckets: u32,
-    pub buckets: Vec<u32>,
-    pub sym_offset: u32,
-    pub bloom_size: u32,
-    pub bloom_shift: u32,
-    pub bloom: Vec<u64>,
-    pub chains: Vec<u32>,
-}
-
-impl GnuHashTable {
-    pub fn size(&self) -> usize {
-        // header + bloom + buckets + table
-        4 * size_of::<u32>()
-            + self.bloom.len() * size_of::<u64>()
-            + self.buckets.len() * size_of::<u32>()
-            + self.chains.len() * size_of::<u32>()
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 
@@ -379,8 +415,8 @@ mod tests {
         let hash2 = Name::from("__libc_start_main").elf_gnu_hash();
         table.add_symbol(create_symbol(2), 0, hash2, Path::new("")).unwrap();
         let sorted = table.sorted();
-        let link_section = Section::new(Default::default());
-        let section = SymbolTable::gnu_hash_section(0, link_section, &sorted[..]);
+        let mut ght = GnuHashTable::default();
+        ght.add_symbols(&sorted);
         let mut expected_hash_table = GnuHashTable {
             nbuckets: 1,
             sym_offset: 1,
@@ -398,8 +434,6 @@ mod tests {
                 expected_hash_table.bloom_shift,
             );
         }
-        let mut buf = Vec::with_capacity(expected_hash_table.size());
-        expected_hash_table.serialize(&mut buf);
-        assert_eq!(*section.read().chunks()[0], buf);
+        assert_eq!(ght, expected_hash_table);
     }
 }

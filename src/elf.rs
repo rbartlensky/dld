@@ -137,7 +137,6 @@ pub enum DynTag {
 
 pub struct Writer<'d> {
     out: File,
-    hash_style: options::HashStyle,
     eh: Header,
     symbols: SymbolTable<'d>,
     dyn_symbols: SymbolTable<'d>,
@@ -162,6 +161,8 @@ pub struct Writer<'d> {
     dynamic_section: SectionPtr,
     dyn_rel_section: SectionPtr,
     plt_rel_section: SectionPtr,
+    hash_section: Option<SectionPtr>,
+    gnu_hash_section: Option<SectionPtr>,
 }
 
 impl<'d> Writer<'d> {
@@ -265,18 +266,41 @@ impl<'d> Writer<'d> {
             ..Default::default()
         };
 
+        let dyn_sym_str_section = Section::builder(dyn_sym_sh).synthetic(dyn_sym_names).build();
+        let dyn_sym_section =
+            Section::builder(dyn_symbols_sh).link(Arc::clone(&dyn_sym_str_section)).build();
+
+        let mut hash_section = None;
+        let mut gnu_hash_section = None;
+        let hash_style = options.hash_style;
+        if hash_style == HashStyle::Sysv || hash_style == HashStyle::Both {
+            let hash_name = section_names.get_or_create(".hash").offset;
+            hash_section = Some(
+                Section::builder(section_with_name(hash_name))
+                    .synthetic(HashTable::default())
+                    .link(Arc::clone(&dyn_sym_section))
+                    .build(),
+            );
+        }
+        if hash_style == HashStyle::Gnu || hash_style == HashStyle::Both {
+            let hash_name = section_names.get_or_create(".gnu.hash").offset;
+            gnu_hash_section = Some(
+                Section::builder(section_with_name(hash_name))
+                    .synthetic(GnuHashTable::default())
+                    .link(Arc::clone(&dyn_sym_section))
+                    .build(),
+            );
+        }
+
         let null_section = Section::new(Default::default());
         let shstr_section = Section::builder(Default::default()).synthetic(section_names).build();
         let sym_str_section = Section::builder(section_with_name(sym_names_sh_name))
             .synthetic(StringTable::default())
             .build();
-        let dyn_sym_str_section = Section::builder(dyn_sym_sh).synthetic(dyn_sym_names).build();
         let got_section = Section::new(got_sh);
         let got_plt_section = Section::new(got_plt_sh);
         let plt_section = Section::builder(plt_sh).synthetic(plt::Plt::default()).build();
         let sym_section = Section::builder(symbols_sh).link(Arc::clone(&sym_str_section)).build();
-        let dyn_sym_section =
-            Section::builder(dyn_symbols_sh).link(Arc::clone(&dyn_sym_str_section)).build();
         let dynamic_section =
             Section::builder(dynamic_sh).link(Arc::clone(&dyn_sym_str_section)).build();
         let dyn_rel_section =
@@ -284,7 +308,7 @@ impl<'d> Writer<'d> {
         let plt_rel_section =
             Section::builder(plt_rel_sh).link(Arc::clone(&dyn_sym_section)).build();
 
-        let sections = vec![
+        let mut sections = vec![
             null_section,
             Arc::clone(&shstr_section),
             Arc::clone(&sym_str_section),
@@ -300,9 +324,15 @@ impl<'d> Writer<'d> {
             Arc::clone(&plt_rel_section),
         ];
 
+        if let Some(s) = hash_section.clone() {
+            sections.push(s)
+        }
+        if let Some(s) = gnu_hash_section.clone() {
+            sections.push(s)
+        }
+
         Ok(Self {
             out,
-            hash_style: options.hash_style,
             eh,
             symbols,
             dyn_symbols,
@@ -328,6 +358,8 @@ impl<'d> Writer<'d> {
             dynamic_section,
             dyn_rel_section,
             plt_rel_section,
+            hash_section,
+            gnu_hash_section,
         })
     }
 
@@ -764,40 +796,23 @@ impl<'d> Writer<'d> {
 
         self.resize_got_section();
         self.resize_got_plt_section();
-        for s in &self.sections {
-            s.write().expand_data();
-        }
 
         self.sym_section.write().sh_size = self.symbols.total_len() as u64;
         self.dyn_sym_section.write().sh_size = self.dyn_symbols.total_len() as u64;
         let sorted = self.dyn_symbols.sorted();
-        let dyn_sym_section = Arc::clone(&self.dyn_sym_section);
+        if let Some(hash_section) = &self.hash_section {
+            hash_section.write().inner_mut::<HashTable>().unwrap().add_symbols(&sorted);
+        }
+        if let Some(gnu_hash_section) = &self.gnu_hash_section {
+            gnu_hash_section.write().inner_mut::<GnuHashTable>().unwrap().add_symbols(&sorted);
+        }
+
+        for s in &self.sections {
+            s.write().expand_data();
+        }
+
         {
-            let mut section_names =
-                WGuard::map(self.shstr_section.write(), |s| s.inner_mut::<StringTable>().unwrap());
-
-            if self.hash_style == HashStyle::Sysv || self.hash_style == HashStyle::Both {
-                let hash_name = section_names.get_or_create(".hash").offset;
-                let sec = SymbolTable::hash_section(
-                    hash_name as u32,
-                    Arc::clone(&dyn_sym_section),
-                    &sorted[..],
-                );
-                sec.write().set_index(self.sections.len());
-                self.sections.push(sec);
-            }
-            if self.hash_style == HashStyle::Gnu || self.hash_style == HashStyle::Both {
-                let hash_name = section_names.get_or_create(".gnu.hash").offset;
-                let sec =
-                    SymbolTable::gnu_hash_section(hash_name as u32, dyn_sym_section, &sorted[..]);
-                sec.write().set_index(self.sections.len());
-                self.sections.push(sec);
-            }
-            drop(section_names);
-            self.shstr_section.write().expand_data();
-            // downgrade the write lock into a read one by reasingment
             let section_names = as_str_tab(&self.shstr_section);
-
             for (sym, dyn_sym) in
                 self.symbols.named_mut().values_mut().filter_map(|s| s.dynamic().map(|d| (s, d)))
             {
@@ -835,7 +850,6 @@ impl<'d> Writer<'d> {
             self.dynamic_section.write().sh_size =
                 ((self.dyn_entries.len() + extra_dyn_entries) * 2 * size_of::<u64>()) as u64;
         }
-
         self.sort_sections();
 
         self.generate_program_headers();
