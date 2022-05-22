@@ -5,16 +5,13 @@ use goblin::elf64::section_header::{SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHT
 
 const PLT_ENTRY_SIZE: usize = 16;
 
+#[derive(Default)]
 pub struct Plt {
     /// Mapping from symbols to plt slots (starting from 0)
     inner: HashMap<SymbolRef, usize>,
 }
 
 impl Plt {
-    pub fn new() -> Self {
-        Self { inner: Default::default() }
-    }
-
     pub fn insert(&mut self, sym_ref: SymbolRef) -> usize {
         let len = self.inner.len();
         *self.inner.entry(sym_ref).or_insert(len)

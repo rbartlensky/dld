@@ -273,7 +273,7 @@ impl<'d> Writer<'d> {
         let dyn_sym_str_section = Section::builder(dyn_sym_sh).synthetic(dyn_sym_names).build();
         let got_section = Section::new(got_sh);
         let got_plt_section = Section::new(got_plt_sh);
-        let plt_section = Section::builder(plt_sh).synthetic(plt::Plt::new()).build();
+        let plt_section = Section::builder(plt_sh).synthetic(plt::Plt::default()).build();
         let sym_section = Section::builder(symbols_sh).link(Arc::clone(&sym_str_section)).build();
         let dyn_sym_section =
             Section::builder(dyn_symbols_sh).link(Arc::clone(&dyn_sym_str_section)).build();

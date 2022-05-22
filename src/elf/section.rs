@@ -1,4 +1,4 @@
-use crate::elf::{chunk::Chunk, SymbolRef, plt::Plt, string_table::StringTable};
+use crate::elf::{chunk::Chunk, plt::Plt, string_table::StringTable, SymbolRef};
 
 use goblin::elf64::section_header::{SectionHeader, SHT_NOBITS};
 use parking_lot::RwLock;
@@ -83,7 +83,6 @@ impl SynthesizedKind {
             Self::StringTable(s) => s,
         }
     }
-
 }
 
 impl Synthesized for SynthesizedKind {
