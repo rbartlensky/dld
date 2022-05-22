@@ -1,4 +1,4 @@
-use crate::elf::{chunk::Chunk, SymbolRef};
+use crate::elf::{chunk::Chunk, SymbolRef, plt::Plt, string_table::StringTable};
 
 use goblin::elf64::section_header::{SectionHeader, SHT_NOBITS};
 use parking_lot::RwLock;
@@ -30,9 +30,10 @@ impl SectionBuilder {
         self
     }
 
-    pub fn synthetic<T: Synthesized + 'static>(mut self, s: T) -> Self {
+    pub fn synthetic<T: Into<SynthesizedKind>>(mut self, s: T) -> Self {
+        let s = s.into();
         s.fill_header(&mut self.section);
-        self.section.synthetic = Some(Box::new(s));
+        self.section.synthetic = Some(s);
         self
     }
 
@@ -51,12 +52,63 @@ impl SectionBuilder {
     }
 }
 
+pub enum SynthesizedKind {
+    Plt(Plt),
+    StringTable(StringTable),
+}
+
+impl From<Plt> for SynthesizedKind {
+    fn from(p: Plt) -> Self {
+        Self::Plt(p)
+    }
+}
+
+impl From<StringTable> for SynthesizedKind {
+    fn from(p: StringTable) -> Self {
+        Self::StringTable(p)
+    }
+}
+
+impl SynthesizedKind {
+    fn as_inner(&self) -> &dyn Synthesized {
+        match self {
+            Self::Plt(p) => p,
+            Self::StringTable(s) => s,
+        }
+    }
+
+    fn as_inner_mut(&mut self) -> &mut dyn Synthesized {
+        match self {
+            Self::Plt(p) => p,
+            Self::StringTable(s) => s,
+        }
+    }
+
+}
+
+impl Synthesized for SynthesizedKind {
+    fn fill_header(&self, sh: &mut SectionHeader) {
+        self.as_inner().fill_header(sh)
+    }
+
+    fn expand_data(&self, sh: &mut Section) {
+        self.as_inner().expand_data(sh)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self.as_inner().as_any()
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self.as_inner_mut().as_any_mut()
+    }
+}
+
 pub struct Section {
     index: usize,
     link: Option<SectionPtr>,
-    // TODO: find a more ergonomic way to represent this, without introducing
-    // generic parameters, or boxing
-    synthetic: Option<Box<dyn Synthesized>>,
+    // TODO: can we go further and get rid of the `Any` casts?
+    synthetic: Option<SynthesizedKind>,
     /// The section header of the section.
     sh: SectionHeader,
     /// The data of the section.
