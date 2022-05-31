@@ -4,7 +4,7 @@ use crate::{name::Name, serialize::Serialize};
 
 use std::collections::HashMap;
 
-use super::section::Synthesized;
+use super::section::{Synthesized, SynthesizedKind};
 
 #[derive(Debug)]
 pub struct Entry {
@@ -91,7 +91,7 @@ impl StringTable {
     }
 }
 
-impl Synthesized for StringTable {
+impl<'p> Synthesized<'p> for StringTable {
     fn fill_header(&self, sh: &mut SectionHeader) {
         sh.sh_type = SHT_STRTAB;
         sh.sh_addralign = 1;
@@ -100,15 +100,23 @@ impl Synthesized for StringTable {
         }
     }
 
-    fn expand_data(&self, sh: &mut super::Section) {
+    fn expand(&self, sh: &mut super::Section) {
         sh.sh_size = self.total_len as u64;
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn as_ref<'k>(kind: &'k SynthesizedKind<'p>) -> Option<&'k Self> {
+        if let SynthesizedKind::StringTable(s) = kind {
+            Some(s)
+        } else {
+            None
+        }
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
+    fn as_ref_mut<'k>(kind: &'k mut SynthesizedKind<'p>) -> Option<&'k mut Self> {
+        if let SynthesizedKind::StringTable(s) = kind {
+            Some(s)
+        } else {
+            None
+        }
     }
 }

@@ -3,6 +3,8 @@ use std::{collections::HashMap, mem::size_of};
 use crate::elf::{section::Synthesized, Section, SymbolRef};
 use goblin::elf64::section_header::{SectionHeader, SHF_ALLOC, SHF_EXECINSTR, SHT_PROGBITS};
 
+use super::section::SynthesizedKind;
+
 const PLT_ENTRY_SIZE: usize = 16;
 
 #[derive(Default)]
@@ -18,14 +20,14 @@ impl Plt {
     }
 }
 
-impl Synthesized for Plt {
+impl<'p> Synthesized<'p> for Plt {
     fn fill_header(&self, sh: &mut SectionHeader) {
         sh.sh_flags = (SHF_ALLOC | SHF_EXECINSTR) as u64;
         sh.sh_type = SHT_PROGBITS;
         sh.sh_addralign = size_of::<u64>() as u64;
     }
 
-    fn expand_data(&self, section: &mut Section) {
+    fn expand(&self, section: &mut Section) {
         let size = (self.inner.len() + 1) * PLT_ENTRY_SIZE;
         section.sh_size = size as u64;
 
@@ -51,11 +53,19 @@ impl Synthesized for Plt {
         section.add_chunk(plt_chunk.into());
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn as_ref<'k>(kind: &'k SynthesizedKind<'p>) -> Option<&'k Self> {
+        if let SynthesizedKind::Plt(p) = kind {
+            Some(p)
+        } else {
+            None
+        }
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
+    fn as_ref_mut<'k>(kind: &'k mut SynthesizedKind<'p>) -> Option<&'k mut Self> {
+        if let SynthesizedKind::Plt(p) = kind {
+            Some(p)
+        } else {
+            None
+        }
     }
 }

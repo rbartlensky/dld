@@ -58,7 +58,7 @@ pub struct Input<'p, 'd> {
 pub struct ElfObject<'i, 'p, 'd, 'e> {
     input: &'i Input<'p, 'd>,
     elf: Elf<'e>,
-    section_relocations: HashMap<usize, elf::SectionRef>,
+    section_relocations: HashMap<usize, elf::SectionRef<'p>>,
     symbols: HashMap<Symbol, elf::SymbolRef>,
 }
 

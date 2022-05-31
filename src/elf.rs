@@ -13,7 +13,8 @@ use goblin::elf64::{
     sym::Sym,
 };
 use parking_lot::{
-    MappedRwLockReadGuard as MapRGuard, RwLockReadGuard as RGuard, RwLockWriteGuard as WGuard,
+    MappedRwLockReadGuard as MapRGuard, MappedRwLockWriteGuard as MapWGuard,
+    RwLockReadGuard as RGuard, RwLockWriteGuard as WGuard,
 };
 use std::{
     cmp::Ordering,
@@ -45,14 +46,14 @@ pub use symbol_table::{GnuHashTable, HashTable, SymbolRef, SymbolTable};
 use self::chunk::Chunk;
 
 #[derive(Clone)]
-pub struct SectionRef {
+pub struct SectionRef<'p> {
     /// The section index where a particular section was relocated to.
-    section: SectionPtr,
+    section: SectionPtr<'p>,
     /// The chunk that the previous section resides in.
     chunk: usize,
 }
 
-impl std::fmt::Debug for SectionRef {
+impl std::fmt::Debug for SectionRef<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SectionRef")
             .field("section", &self.section.read().index())
@@ -138,11 +139,9 @@ pub enum DynTag {
 pub struct Writer<'d> {
     out: File,
     eh: Header,
-    symbols: SymbolTable<'d>,
-    dyn_symbols: SymbolTable<'d>,
     dyn_rels: Vec<Rela>,
     plt_rels: Vec<Rela>,
-    sections: Vec<SectionPtr>,
+    sections: Vec<SectionPtr<'d>>,
     got_len: usize,
     got_plt: HashMap<SymbolRef, usize>,
     dyn_entries: Vec<(DynTag, u64)>,
@@ -150,19 +149,19 @@ pub struct Writer<'d> {
     p_vaddr: u64,
     start_p_vaddr: u64,
     file_offset: u64,
-    shstr_section: SectionPtr,
-    sym_str_section: SectionPtr,
-    dyn_sym_str_section: SectionPtr,
-    sym_section: SectionPtr,
-    dyn_sym_section: SectionPtr,
-    got_section: SectionPtr,
-    plt_section: SectionPtr,
-    got_plt_section: SectionPtr,
-    dynamic_section: SectionPtr,
-    dyn_rel_section: SectionPtr,
-    plt_rel_section: SectionPtr,
-    hash_section: Option<SectionPtr>,
-    gnu_hash_section: Option<SectionPtr>,
+    shstr_section: SectionPtr<'d>,
+    sym_str_section: SectionPtr<'d>,
+    dyn_sym_str_section: SectionPtr<'d>,
+    sym_section: SectionPtr<'d>,
+    dyn_sym_section: SectionPtr<'d>,
+    got_section: SectionPtr<'d>,
+    plt_section: SectionPtr<'d>,
+    got_plt_section: SectionPtr<'d>,
+    dynamic_section: SectionPtr<'d>,
+    dyn_rel_section: SectionPtr<'d>,
+    plt_rel_section: SectionPtr<'d>,
+    hash_section: Option<SectionPtr<'d>>,
+    gnu_hash_section: Option<SectionPtr<'d>>,
 }
 
 impl<'d> Writer<'d> {
@@ -193,7 +192,7 @@ impl<'d> Writer<'d> {
         };
         let mut section_names = StringTable::with_name(".shstrtab");
         let sym_names_sh_name = section_names.get_or_create(".strtab").offset;
-        let dyn_sym_sh = SectionHeader {
+        let dyn_sym_names_sh = SectionHeader {
             sh_name: section_names.get_or_create(".dynstr").offset as u32,
             sh_flags: SHF_ALLOC as u64,
             ..Default::default()
@@ -234,10 +233,22 @@ impl<'d> Writer<'d> {
         let mut plt_sh = section;
         plt_sh.sh_name = section_names.get_or_create(".plt").offset as u32;
 
-        let (symbols, symbols_sh) =
-            SymbolTable::new(section_names.get_or_create(".symtab").offset as u32, false);
-        let (dyn_symbols, dyn_symbols_sh) =
-            SymbolTable::new(section_names.get_or_create(".dynsym").offset as u32, true);
+        let sym_str_section = Section::builder(section_with_name(sym_names_sh_name))
+            .synthetic(StringTable::default())
+            .build();
+        let sym_section =
+            Section::builder(section_with_name(section_names.get_or_create(".symtab").offset))
+                .synthetic(SymbolTable::new(false))
+                .link(Arc::clone(&sym_str_section))
+                .build();
+
+        let dyn_sym_str_section =
+            Section::builder(dyn_sym_names_sh).synthetic(dyn_sym_names).build();
+        let dyn_sym_section =
+            Section::builder(section_with_name(section_names.get_or_create(".dynsym").offset))
+                .synthetic(SymbolTable::new(true))
+                .link(Arc::clone(&dyn_sym_str_section))
+                .build();
 
         let dynamic_sh = SectionHeader {
             sh_name: section_names.get_or_create(".dynamic").offset as u32,
@@ -266,10 +277,6 @@ impl<'d> Writer<'d> {
             ..Default::default()
         };
 
-        let dyn_sym_str_section = Section::builder(dyn_sym_sh).synthetic(dyn_sym_names).build();
-        let dyn_sym_section =
-            Section::builder(dyn_symbols_sh).link(Arc::clone(&dyn_sym_str_section)).build();
-
         let mut hash_section = None;
         let mut gnu_hash_section = None;
         let hash_style = options.hash_style;
@@ -294,13 +301,9 @@ impl<'d> Writer<'d> {
 
         let null_section = Section::new(Default::default());
         let shstr_section = Section::builder(Default::default()).synthetic(section_names).build();
-        let sym_str_section = Section::builder(section_with_name(sym_names_sh_name))
-            .synthetic(StringTable::default())
-            .build();
         let got_section = Section::new(got_sh);
         let got_plt_section = Section::new(got_plt_sh);
         let plt_section = Section::builder(plt_sh).synthetic(plt::Plt::default()).build();
-        let sym_section = Section::builder(symbols_sh).link(Arc::clone(&sym_str_section)).build();
         let dynamic_section =
             Section::builder(dynamic_sh).link(Arc::clone(&dyn_sym_str_section)).build();
         let dyn_rel_section =
@@ -334,8 +337,6 @@ impl<'d> Writer<'d> {
         Ok(Self {
             out,
             eh,
-            symbols,
-            dyn_symbols,
             dyn_rels: vec![],
             plt_rels: vec![],
             sections,
@@ -370,7 +371,7 @@ impl<'d> Writer<'d> {
         name: impl Into<Name>,
         sh: &goblin::elf::SectionHeader,
         data: Option<Vec<u8>>,
-    ) -> SectionRef {
+    ) -> SectionRef<'d> {
         let entry =
             self.shstr_section.write().inner_mut::<StringTable>().unwrap().get_or_create(name);
         let (section, chunk) = if entry.new {
@@ -410,7 +411,7 @@ impl<'d> Writer<'d> {
         name: impl Into<Name>,
         section: &goblin::elf::SectionHeader,
         data: Option<&[u8]>,
-    ) -> SectionRef {
+    ) -> SectionRef<'d> {
         let data = data.map(|v| v.to_owned());
         self.add_section(name, section, data)
     }
@@ -453,7 +454,7 @@ impl<'d> Writer<'d> {
             name,
             reference,
             self.sym_str_section.write().inner_mut::<StringTable>().unwrap(),
-            &mut self.symbols,
+            self.sym_section.write().inner_mut::<SymbolTable<'d>>().unwrap(),
         )
         .map(Some)
     }
@@ -474,23 +475,22 @@ impl<'d> Writer<'d> {
             name,
             reference,
             self.dyn_sym_str_section.write().inner_mut::<StringTable>().unwrap(),
-            &mut self.dyn_symbols,
+            self.dyn_sym_section.write().inner_mut::<SymbolTable<'d>>().unwrap(),
         );
         if let Ok(dyn_ref) = r {
             if let Some(entry) =
                 self.sym_str_section.read().inner::<StringTable>().unwrap().get(name.to_string())
             {
-                self.symbols
+                self.sym_section
+                    .write()
+                    .inner_mut::<SymbolTable<'d>>()
+                    .unwrap()
                     .get_mut(SymbolRef::Named(entry.offset as u32))
                     .unwrap()
                     .set_dynamic(dyn_ref);
             }
         }
         r.map(Some)
-    }
-
-    pub fn symbol(&self, sym: SymbolRef) -> Symbol<'_> {
-        *self.symbols.get(sym).unwrap()
     }
 
     pub fn symbol_name(&self, sym: SymbolRef) -> Option<MapRGuard<str>> {
@@ -505,7 +505,8 @@ impl<'d> Writer<'d> {
 
     pub fn undefined_symbols(&self) -> Vec<SymbolRef> {
         let mut undefined = vec![];
-        for (st_name, sym) in self.symbols.named().iter() {
+        let symbols = as_sym_tab(&self.sym_section);
+        for (st_name, sym) in symbols.named().iter() {
             if sym.st_shndx as u32 == SHN_UNDEF
                 && (sym.is_global() || sym.is_weak())
                 && sym.dynamic().is_none()
@@ -607,8 +608,9 @@ impl<'d> Writer<'d> {
             .unwrap();
 
         let mut got_plt_section = self.got_plt_section.write();
+        let symbols = as_sym_tab(&self.sym_section);
         for (sym, offset) in &self.got_plt {
-            let sym = self.symbols.get(*sym).unwrap();
+            let sym = symbols.get(*sym).unwrap();
             let plt_entry_addr = plt_entry_addr(plt_address, sym.plt_index().unwrap());
             // + `PLT_ENTRY_JMP_INSTR_SIZE` since initially we want to jump back past the `jmp`
             // instruction of the plt entry
@@ -656,14 +658,15 @@ impl<'d> Writer<'d> {
         let section_names = as_str_tab(&self.shstr_section);
 
         let got_plt_addr = self.got_plt_address();
+
         if let Some(e) = symbol_names.get("_GLOBAL_OFFSET_TABLE_") {
-            if let Some(s) = self.symbols.get_mut(SymbolRef::Named(e.offset as u32)) {
+            let mut symbols = as_mut_sym_tab(&self.sym_section);
+            if let Some(s) = symbols.get_mut(SymbolRef::Named(e.offset as u32)) {
                 s.st_shndx = self.got_plt_section.read().index() as u16;
                 s.st_value = got_plt_addr;
             };
         }
         let skip = [self.sym_str_section.read().sh_name, self.shstr_section.read().sh_name];
-        let symbols = &mut self.symbols;
         for section in self.sections.iter().filter(|s| !skip.contains(&s.read().sh_name)) {
             let mut section = section.write();
             if is_some_with(section_names.sh_name(".init_array"), &section.sh_name) {
@@ -672,6 +675,7 @@ impl<'d> Writer<'d> {
                 }
                 if let Some(s) = symbol_names.get("__init_array_end") {
                     let sym_ref = SymbolRef::Named(s.offset as u32);
+                    let mut symbols = as_mut_sym_tab(&self.sym_section);
                     symbols.get_mut(sym_ref).unwrap().st_value = section.size_on_disk();
                     let chunk_index = section.last_chunk_index();
                     section.chunk_mut(chunk_index).add_symbol(sym_ref);
@@ -682,6 +686,7 @@ impl<'d> Writer<'d> {
                 }
                 if let Some(s) = symbol_names.get("__fini_array_end") {
                     let sym_ref = SymbolRef::Named(s.offset as u32);
+                    let mut symbols = as_mut_sym_tab(&self.sym_section);
                     symbols.get_mut(sym_ref).unwrap().st_value = section.size_on_disk();
                     let chunk_index = section.last_chunk_index();
                     section.chunk_mut(chunk_index).add_symbol(sym_ref);
@@ -691,15 +696,6 @@ impl<'d> Writer<'d> {
     }
 
     fn compute_tables(&mut self) {
-        // populate symbol sections
-        for (sh, syms) in
-            [(&self.sym_section, &mut self.symbols), (&self.dyn_sym_section, &mut self.dyn_symbols)]
-        {
-            let mut section = sh.write();
-            section.add_chunk(syms.chunk());
-            section.sh_info = syms.num_locals() as u32;
-        }
-
         // populate string sections
         for sh in [&self.shstr_section, &self.sym_str_section, &self.dyn_sym_str_section] {
             let strs = as_str_tab(sh).chunk();
@@ -745,6 +741,7 @@ impl<'d> Writer<'d> {
     fn scan_relocations(&mut self) {
         for section in &mut self.sections {
             for chunk in section.write().chunks_mut() {
+                let mut symbols = as_mut_sym_tab(&self.sym_section);
                 for (reloc, sym_ref) in chunk.relocations_mut() {
                     let r_type = reloc.r_info as u32;
                     match r_type as u32 {
@@ -756,7 +753,7 @@ impl<'d> Writer<'d> {
                         | R_X86_64_REX_GOTPCRELX
                         | R_X86_64_TLSGD
                         | R_X86_64_GOTTPOFF => {
-                            let sym = self.symbols.get_mut(*sym_ref).unwrap();
+                            let sym = symbols.get_mut(*sym_ref).unwrap();
                             if sym.got_offset().is_none() {
                                 sym.set_got_offset(self.got_len * size_of::<u64>());
                                 // For TLSGD relocations we need to allocate two slots
@@ -765,7 +762,7 @@ impl<'d> Writer<'d> {
                             }
                         }
                         R_X86_64_PLT32 => {
-                            let sym = self.symbols.get_mut(*sym_ref).unwrap();
+                            let sym = symbols.get_mut(*sym_ref).unwrap();
                             if sym.dynamic().is_some() {
                                 let len = self.got_plt.len() + 3;
                                 let offset =
@@ -797,9 +794,10 @@ impl<'d> Writer<'d> {
         self.resize_got_section();
         self.resize_got_plt_section();
 
-        self.sym_section.write().sh_size = self.symbols.total_len() as u64;
-        self.dyn_sym_section.write().sh_size = self.dyn_symbols.total_len() as u64;
-        let sorted = self.dyn_symbols.sorted();
+        // XXX: this needs to be done out of band...
+        self.dyn_sym_section.write().expand();
+        let dyn_syms = as_sym_tab(&self.dyn_sym_section);
+        let sorted = dyn_syms.sorted();
         if let Some(hash_section) = &self.hash_section {
             hash_section.write().inner_mut::<HashTable>().unwrap().add_symbols(&sorted);
         }
@@ -807,14 +805,16 @@ impl<'d> Writer<'d> {
             gnu_hash_section.write().inner_mut::<GnuHashTable>().unwrap().add_symbols(&sorted);
         }
 
-        for s in &self.sections {
-            s.write().expand_data();
+        // at this point `index` is useless...
+        for s in self.sections.iter().filter(|s| s.read().sh_type != SHT_DYNSYM) {
+            s.write().expand();
         }
 
         {
+            let mut symbols = as_mut_sym_tab(&self.sym_section);
             let section_names = as_str_tab(&self.shstr_section);
             for (sym, dyn_sym) in
-                self.symbols.named_mut().values_mut().filter_map(|s| s.dynamic().map(|d| (s, d)))
+                symbols.named_mut().values_mut().filter_map(|s| s.dynamic().map(|d| (s, d)))
             {
                 let mut calculated_index = None;
                 let mut index = || {
@@ -843,6 +843,7 @@ impl<'d> Writer<'d> {
 
             self.plt_rel_section.write().sh_size = (self.plt_rels.len() * size_of::<Rela>()) as u64;
 
+            drop(symbols);
             // calculate how many dyntags we have, so that we know how big our dynamic section is
             // + 1 for the null entry
             let extra_dyn_entries =
@@ -850,6 +851,8 @@ impl<'d> Writer<'d> {
             self.dynamic_section.write().sh_size =
                 ((self.dyn_entries.len() + extra_dyn_entries) * 2 * size_of::<u64>()) as u64;
         }
+        drop(dyn_syms);
+
         self.sort_sections();
 
         self.generate_program_headers();
@@ -862,13 +865,19 @@ impl<'d> Writer<'d> {
     fn handle_relocations(&mut self) {
         let got_address = self.got_address();
         let plt_address = self.plt_address();
+        let sh_name = self.sym_section.read().sh_name;
+
         // first patch symbol values
-        for section in &mut self.sections.iter_mut().skip(1) {
-            section.write().patch_symbol_values(&mut self.symbols);
+        for section in &mut self.sections.iter_mut().skip(1).filter(|s| s.read().sh_name != sh_name)
+        {
+            let mut symbols = as_mut_sym_tab(&self.sym_section);
+            section.write().patch_symbol_values(&mut symbols);
         }
-        for section in &mut self.sections.iter_mut().skip(1) {
+        let symbols = as_sym_tab(&self.sym_section);
+        for section in &mut self.sections.iter_mut().skip(1).filter(|s| s.read().sh_name != sh_name)
+        {
             for chunk in section.write().chunks_mut() {
-                chunk.apply_relocations(got_address, plt_address, &self.symbols);
+                chunk.apply_relocations(got_address, plt_address, &symbols);
             }
         }
     }
@@ -893,7 +902,8 @@ impl<'d> Writer<'d> {
         if let Some(entry) =
             self.sym_str_section.read().inner::<StringTable>().unwrap().get("_start")
         {
-            self.eh.e_entry = self.symbols[SymbolRef::Named(entry.offset as u32)].st_value;
+            let symbols = as_sym_tab(&self.sym_section);
+            self.eh.e_entry = symbols[SymbolRef::Named(entry.offset as u32)].st_value;
         }
         self.eh.e_shnum = self.sections.len() as u16;
         self.eh.e_phnum = self.program_headers.len() as u16;
@@ -1206,6 +1216,14 @@ fn section_with_name(name: usize) -> SectionHeader {
     SectionHeader { sh_name: name as u32, ..Default::default() }
 }
 
-fn as_str_tab(sec: &SectionPtr) -> MapRGuard<StringTable> {
+fn as_str_tab<'a>(sec: &'a SectionPtr<'_>) -> MapRGuard<'a, StringTable> {
     RGuard::map(sec.read(), |s| s.inner::<StringTable>().unwrap())
+}
+
+fn as_sym_tab<'a, 'p>(sec: &'a SectionPtr<'p>) -> MapRGuard<'a, SymbolTable<'p>> {
+    RGuard::map(sec.read(), |s| s.inner::<SymbolTable<'p>>().unwrap())
+}
+
+fn as_mut_sym_tab<'a, 'p>(sec: &'a SectionPtr<'p>) -> MapWGuard<'a, SymbolTable<'p>> {
+    WGuard::map(sec.write(), |s| s.inner_mut::<SymbolTable<'p>>().unwrap())
 }

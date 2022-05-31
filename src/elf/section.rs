@@ -8,35 +8,39 @@ use crate::elf::{
 
 use goblin::elf64::section_header::{SectionHeader, SHT_NOBITS};
 use parking_lot::RwLock;
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
-pub type SectionPtr = Arc<RwLock<Section>>;
+use super::SymbolTable;
 
-pub trait Synthesized {
+pub type SectionPtr<'p> = Arc<RwLock<Section<'p>>>;
+
+pub trait Synthesized<'p> {
     fn fill_header(&self, sh: &mut SectionHeader);
 
-    fn expand_data(&self, sh: &mut Section);
+    fn expand(&self, sh: &mut Section);
 
-    fn as_any(&self) -> &dyn Any;
+    fn finalize(&self, _sh: &mut Section) {}
 
-    fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn as_ref<'k>(kind: &'k SynthesizedKind<'p>) -> Option<&'k Self>;
+
+    fn as_ref_mut<'k>(kind: &'k mut SynthesizedKind<'p>) -> Option<&'k mut Self>;
 }
 
-pub struct SectionBuilder {
-    section: Section,
+pub struct SectionBuilder<'p> {
+    section: Section<'p>,
 }
 
-impl SectionBuilder {
+impl<'p> SectionBuilder<'p> {
     pub fn new(sh: SectionHeader) -> Self {
         Self { section: Section { index: 0, link: None, synthetic: None, sh, chunks: vec![] } }
     }
 
-    pub fn link(mut self, link: SectionPtr) -> Self {
+    pub fn link(mut self, link: SectionPtr<'p>) -> Self {
         self.section.link = Some(link);
         self
     }
 
-    pub fn synthetic<T: Into<SynthesizedKind>>(mut self, s: T) -> Self {
+    pub fn synthetic<T: Into<SynthesizedKind<'p>>>(mut self, s: T) -> Self {
         let s = s.into();
         s.fill_header(&mut self.section);
         self.section.synthetic = Some(s);
@@ -53,97 +57,112 @@ impl SectionBuilder {
         self
     }
 
-    pub fn build(self) -> SectionPtr {
+    pub fn build(self) -> SectionPtr<'p> {
         Arc::new(RwLock::new(self.section))
     }
 }
 
-pub enum SynthesizedKind {
+pub enum SynthesizedKind<'p> {
     Plt(Plt),
     StringTable(StringTable),
     Hash(HashTable),
     GnuHash(GnuHashTable),
+    SymbolTable(SymbolTable<'p>),
 }
 
-impl From<Plt> for SynthesizedKind {
+impl From<Plt> for SynthesizedKind<'_> {
     fn from(p: Plt) -> Self {
         Self::Plt(p)
     }
 }
 
-impl From<StringTable> for SynthesizedKind {
+impl From<StringTable> for SynthesizedKind<'_> {
     fn from(p: StringTable) -> Self {
         Self::StringTable(p)
     }
 }
 
-impl From<HashTable> for SynthesizedKind {
+impl From<HashTable> for SynthesizedKind<'_> {
     fn from(p: HashTable) -> Self {
         Self::Hash(p)
     }
 }
 
-impl From<GnuHashTable> for SynthesizedKind {
+impl From<GnuHashTable> for SynthesizedKind<'_> {
     fn from(p: GnuHashTable) -> Self {
         Self::GnuHash(p)
     }
 }
 
-impl SynthesizedKind {
-    fn as_inner(&self) -> &dyn Synthesized {
-        match self {
-            Self::Plt(p) => p,
-            Self::StringTable(s) => s,
-            Self::Hash(h) => h,
-            Self::GnuHash(h) => h,
-        }
-    }
-
-    fn as_inner_mut(&mut self) -> &mut dyn Synthesized {
-        match self {
-            Self::Plt(p) => p,
-            Self::StringTable(s) => s,
-            Self::Hash(h) => h,
-            Self::GnuHash(h) => h,
-        }
+impl<'p> From<SymbolTable<'p>> for SynthesizedKind<'p> {
+    fn from(p: SymbolTable<'p>) -> Self {
+        Self::SymbolTable(p)
     }
 }
 
-impl Synthesized for SynthesizedKind {
+impl<'p> Synthesized<'p> for SynthesizedKind<'p> {
     fn fill_header(&self, sh: &mut SectionHeader) {
-        self.as_inner().fill_header(sh)
+        use SynthesizedKind::*;
+
+        match self {
+            Plt(p) => p.fill_header(sh),
+            StringTable(s) => s.fill_header(sh),
+            Hash(h) => h.fill_header(sh),
+            GnuHash(h) => h.fill_header(sh),
+            SymbolTable(s) => s.fill_header(sh),
+        }
     }
 
-    fn expand_data(&self, sh: &mut Section) {
-        self.as_inner().expand_data(sh)
+    fn expand(&self, sh: &mut Section) {
+        use SynthesizedKind::*;
+
+        match self {
+            Plt(p) => p.expand(sh),
+            StringTable(s) => s.expand(sh),
+            Hash(h) => h.expand(sh),
+            GnuHash(h) => h.expand(sh),
+            SymbolTable(s) => s.expand(sh),
+        }
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self.as_inner().as_any()
+    fn finalize(&self, sh: &mut Section) {
+        use SynthesizedKind::*;
+
+        match self {
+            Plt(p) => p.finalize(sh),
+            StringTable(s) => s.finalize(sh),
+            Hash(h) => h.finalize(sh),
+            GnuHash(h) => h.finalize(sh),
+            SymbolTable(s) => s.finalize(sh),
+        }
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self.as_inner_mut().as_any_mut()
+    fn as_ref(_kind: &SynthesizedKind<'p>) -> Option<&'p Self> {
+        None
+    }
+
+    fn as_ref_mut(_kind: &mut SynthesizedKind<'p>) -> Option<&'p mut Self> {
+        None
     }
 }
 
-pub struct Section {
+pub struct Section<'p> {
     index: usize,
-    link: Option<SectionPtr>,
+    link: Option<SectionPtr<'p>>,
     // TODO: can we go further and get rid of the `Any` casts?
-    synthetic: Option<SynthesizedKind>,
+    synthetic: Option<SynthesizedKind<'p>>,
     /// The section header of the section.
     sh: SectionHeader,
     /// The data of the section.
     chunks: Vec<Chunk>,
 }
 
-impl Section {
-    pub fn new(sh: SectionHeader) -> SectionPtr {
+impl<'p> Section<'p> {
+    pub fn new(sh: SectionHeader) -> SectionPtr<'p> {
         Self::builder(sh).build()
     }
 
-    pub fn builder(sh: SectionHeader) -> SectionBuilder {
+    pub fn builder(sh: SectionHeader) -> SectionBuilder<'p> {
         SectionBuilder::new(sh)
     }
 
@@ -211,30 +230,34 @@ impl Section {
         self.index = index;
     }
 
-    pub fn inner<T: Synthesized + 'static>(&self) -> Option<&T> {
+    pub fn inner<T: Synthesized<'p>>(&self) -> Option<&T> {
         if let Some(s) = &self.synthetic {
-            s.as_any().downcast_ref()
+            T::as_ref(s)
         } else {
             None
         }
     }
 
-    pub fn inner_mut<T: Synthesized + 'static>(&mut self) -> Option<&mut T> {
+    pub fn inner_mut<T: Synthesized<'p>>(&mut self) -> Option<&mut T> {
         if let Some(s) = &mut self.synthetic {
-            s.as_any_mut().downcast_mut()
+            T::as_ref_mut(s)
         } else {
             None
         }
     }
 
-    pub fn expand_data(&mut self) {
+    pub fn expand(&mut self) {
         if let Some(inner) = self.synthetic.take() {
-            inner.expand_data(self);
+            inner.expand(self);
             self.synthetic = Some(inner);
         }
     }
 
     pub fn finalize(&mut self) {
+        if let Some(inner) = self.synthetic.take() {
+            inner.finalize(self);
+            self.synthetic = Some(inner);
+        }
         let new_link = if let Some(link) = &self.link {
             link.read().index() as u32
         } else {
@@ -244,7 +267,7 @@ impl Section {
     }
 }
 
-impl std::ops::Deref for Section {
+impl std::ops::Deref for Section<'_> {
     type Target = SectionHeader;
 
     fn deref(&self) -> &Self::Target {
@@ -252,7 +275,7 @@ impl std::ops::Deref for Section {
     }
 }
 
-impl std::ops::DerefMut for Section {
+impl std::ops::DerefMut for Section<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.sh
     }

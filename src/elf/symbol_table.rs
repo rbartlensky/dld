@@ -16,7 +16,7 @@ use std::{
 };
 use thiserror::Error;
 
-use super::section::Synthesized;
+use super::section::{Synthesized, SynthesizedKind};
 
 /// A symbol can be fetched by indexing `symbols` in the following way: `symbols[st_name]`.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -48,12 +48,17 @@ pub struct SymbolTable<'p> {
     symbols: HashMap<u32, Symbol<'p>>,
     section_syms: HashMap<u16, Vec<Symbol<'p>>>,
     num_locals: usize,
+    is_dynamic: bool,
 }
 
 impl Default for SymbolTable<'_> {
     fn default() -> Self {
-        let mut table =
-            Self { symbols: Default::default(), section_syms: Default::default(), num_locals: 0 };
+        let mut table = Self {
+            symbols: Default::default(),
+            section_syms: Default::default(),
+            num_locals: 0,
+            is_dynamic: false,
+        };
         table
             .add_symbol(
                 Sym { st_shndx: SHN_UNDEF as u16, ..Default::default() },
@@ -67,18 +72,8 @@ impl Default for SymbolTable<'_> {
 }
 
 impl<'p> SymbolTable<'p> {
-    pub fn new(sh_name: u32, is_dynamic: bool) -> (Self, SectionHeader) {
-        (
-            Default::default(),
-            SectionHeader {
-                sh_name,
-                sh_type: if is_dynamic { SHT_DYNSYM } else { SHT_SYMTAB },
-                sh_entsize: size_of::<Sym>() as u64,
-                sh_flags: if is_dynamic { SHF_ALLOC as u64 } else { 0 },
-                sh_addralign: std::mem::align_of::<u64>() as u64,
-                ..Default::default()
-            },
-        )
+    pub fn new(is_dynamic: bool) -> Self {
+        Self { is_dynamic, ..Default::default() }
     }
 
     pub fn add_symbol(
@@ -196,6 +191,46 @@ impl<'p> SymbolTable<'p> {
     }
 }
 
+impl<'p> Synthesized<'p> for SymbolTable<'p> {
+    fn fill_header(&self, sh: &mut SectionHeader) {
+        *sh = SectionHeader {
+            sh_type: if self.is_dynamic { SHT_DYNSYM } else { SHT_SYMTAB },
+            sh_entsize: size_of::<Sym>() as u64,
+            sh_flags: if self.is_dynamic { SHF_ALLOC as u64 } else { 0 },
+            sh_addralign: std::mem::align_of::<u64>() as u64,
+            ..*sh
+        };
+    }
+
+    fn expand(&self, sh: &mut Section) {
+        sh.add_chunk(self.chunk());
+        sh.sh_info = self.num_locals() as u32;
+        sh.sh_size = self.total_len() as u64;
+    }
+
+    fn finalize(&self, sh: &mut Section) {
+        // symbol values might've been patched
+        // TODO: don't regenerate chunk again, just patch it in place
+        *sh.chunk_mut(0) = self.chunk();
+    }
+
+    fn as_ref<'k>(kind: &'k SynthesizedKind<'p>) -> Option<&'k Self> {
+        if let SynthesizedKind::SymbolTable(s) = kind {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
+    fn as_ref_mut<'k>(kind: &'k mut SynthesizedKind<'p>) -> Option<&'k mut Self> {
+        if let SynthesizedKind::SymbolTable(s) = kind {
+            Some(s)
+        } else {
+            None
+        }
+    }
+}
+
 fn calculate_bloom(bloom: &mut [u64], hash: u32, elfclass_bits: u32, bloom_shift: u32) {
     let index = ((hash / elfclass_bits) % bloom.len() as u32) as usize;
     bloom[index] |= 1_u64 << (hash % elfclass_bits);
@@ -262,7 +297,7 @@ impl HashTable {
     }
 }
 
-impl Synthesized for HashTable {
+impl<'p> Synthesized<'p> for HashTable {
     fn fill_header(&self, sh: &mut SectionHeader) {
         *sh = SectionHeader {
             sh_type: SHT_HASH,
@@ -274,19 +309,27 @@ impl Synthesized for HashTable {
         }
     }
 
-    fn expand_data(&self, sh: &mut Section) {
+    fn expand(&self, sh: &mut Section) {
         let mut data = Vec::with_capacity(self.size());
         self.serialize(&mut data);
         sh.sh_size = data.len() as u64;
         sh.add_chunk(data.into());
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn as_ref<'k>(kind: &'k SynthesizedKind<'p>) -> Option<&'k Self> {
+        if let SynthesizedKind::Hash(h) = kind {
+            Some(h)
+        } else {
+            None
+        }
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
+    fn as_ref_mut<'k>(kind: &'k mut SynthesizedKind<'p>) -> Option<&'k mut Self> {
+        if let SynthesizedKind::Hash(h) = kind {
+            Some(h)
+        } else {
+            None
+        }
     }
 }
 
@@ -369,7 +412,7 @@ impl GnuHashTable {
     }
 }
 
-impl Synthesized for GnuHashTable {
+impl<'p> Synthesized<'p> for GnuHashTable {
     fn fill_header(&self, sh: &mut SectionHeader) {
         *sh = SectionHeader {
             sh_type: SHT_GNU_HASH,
@@ -380,19 +423,27 @@ impl Synthesized for GnuHashTable {
         }
     }
 
-    fn expand_data(&self, sh: &mut Section) {
+    fn expand(&self, sh: &mut Section) {
         let mut data = Vec::with_capacity(self.size());
         self.serialize(&mut data);
         sh.sh_size = data.len() as u64;
         sh.add_chunk(data.into());
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn as_ref<'k>(kind: &'k SynthesizedKind<'p>) -> Option<&'k Self> {
+        if let SynthesizedKind::GnuHash(h) = kind {
+            Some(h)
+        } else {
+            None
+        }
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
+    fn as_ref_mut<'k>(kind: &'k mut SynthesizedKind<'p>) -> Option<&'k mut Self> {
+        if let SynthesizedKind::GnuHash(h) = kind {
+            Some(h)
+        } else {
+            None
+        }
     }
 }
 
@@ -409,7 +460,7 @@ mod tests {
 
     #[test]
     fn gnu_hash_table() {
-        let (mut table, _) = SymbolTable::new(1, true);
+        let mut table = SymbolTable::new(true);
         let hash1 = Name::from("printf").elf_gnu_hash();
         table.add_symbol(create_symbol(1), 0, hash1, Path::new("")).unwrap();
         let hash2 = Name::from("__libc_start_main").elf_gnu_hash();
