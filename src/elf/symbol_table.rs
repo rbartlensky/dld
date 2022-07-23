@@ -281,16 +281,16 @@ impl HashTable {
         let mut chains = vec![0_u32; symbols.len()];
         for (symbol_index, symbol) in symbols.iter().enumerate() {
             let bucket_index = (symbol.hash() % nbuckets) as usize;
-            if buckets[bucket_index] == 0 {
+            let mut chain_index = buckets[bucket_index];
+            if chain_index == 0 {
                 buckets[bucket_index] = symbol_index as u32;
             } else {
-                let mut chain_index = bucket_index;
-                let mut next_chain = chains[bucket_index];
-                while next_chain != 0 {
-                    chain_index = chains[next_chain as usize] as usize;
-                    next_chain = chains[chain_index];
+                let mut next = chains[chain_index as usize];
+                while next != 0 {
+                    chain_index = next;
+                    next = chains[chain_index as usize];
                 }
-                chains[chain_index] = symbol_index as u32;
+                chains[chain_index as usize] = symbol_index as u32;
             }
         }
         *self = Self::new(buckets, chains);
