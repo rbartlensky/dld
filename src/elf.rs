@@ -928,7 +928,7 @@ impl<'d> Writer<'d> {
             offset += ph.serialize(&mut self.out);
         }
         for (i, section) in self.sections.iter().enumerate() {
-            let section = section.read();
+            let mut section = section.write();
             // add the necessary padding between aligned sections
             if offset < section.sh_offset as usize {
                 self.out
@@ -950,20 +950,20 @@ impl<'d> Writer<'d> {
                     .unwrap()
                     .name(section.sh_name as usize)
             );
+            section.finalize();
             for chunk in section.chunks() {
                 self.out.write_all(chunk).unwrap();
             }
             offset += section.size_on_disk() as usize;
         }
         for (i, section) in self.sections.iter().enumerate() {
-            let mut section = section.write();
+            let section = section.write();
             log::trace!(
                 "0x{:x}: ---- section {} ----\n{:#?}",
                 offset,
                 i,
                 &*section as &SectionHeader
             );
-            section.finalize();
             offset += section.serialize(&mut self.out);
         }
         let mut perm = self.out.metadata().unwrap().permissions();
