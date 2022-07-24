@@ -153,11 +153,11 @@ pub struct Linker {
 impl Linker {
     fn find_undefined_symbols_in_libs<'o>(
         &'o self,
-        symbols: Vec<elf::SymbolRef>,
+        symbols: &[elf::SymbolRef],
         writer: &mut elf::Writer<'o>,
     ) -> Result<Vec<elf::SymbolRef>, Error<'o>> {
         let mut undefines =
-            symbols.into_iter().map(|s| (s, false)).collect::<HashMap<elf::SymbolRef, bool>>();
+            symbols.iter().map(|s| (*s, false)).collect::<HashMap<elf::SymbolRef, bool>>();
         for (lib, _) in &self.options.shared_libs {
             let path = lib.as_path();
             let data = read(path).map_path_err(path)?;
@@ -186,11 +186,11 @@ impl Linker {
 
     fn process_archives_containing<'o>(
         &'o self,
-        symbols: Vec<elf::SymbolRef>,
+        symbols: &[elf::SymbolRef],
         writer: &mut elf::Writer<'o>,
-    ) -> Result<(), Error<'o>> {
+    ) -> Result<Vec<elf::SymbolRef>, Error<'o>> {
         let mut undefines =
-            symbols.into_iter().map(|s| (s, false)).collect::<HashMap<elf::SymbolRef, bool>>();
+            symbols.iter().map(|s| (*s, false)).collect::<HashMap<elf::SymbolRef, bool>>();
         for ar in &self.archives {
             let path = ar.as_path();
             let data = read(path).map_path_err(path)?;
@@ -219,7 +219,7 @@ impl Linker {
             }
             undefines.retain(|_, found| !*found);
         }
-        Ok(())
+        Ok(undefines.into_iter().map(|(k, _)| k).collect())
     }
 
     pub fn link(&self) -> Result<(), Error<'_>> {
@@ -245,13 +245,19 @@ impl Linker {
         }
         for elf in &mut elfs {
             elf.process_symbols(&mut writer)?;
-        }
-        for elf in &mut elfs {
             elf.process_relocations(&mut writer)?;
         }
-        let undefined = writer.undefined_symbols();
-        let undefined = self.find_undefined_symbols_in_libs(undefined, &mut writer)?;
-        self.process_archives_containing(undefined, &mut writer)?;
+        let mut undefined = writer.undefined_symbols();
+        loop {
+            let undefined_next = self.find_undefined_symbols_in_libs(&undefined, &mut writer)?;
+            let undefined_next = self.process_archives_containing(&undefined_next, &mut writer)?;
+            // if the length doesn't change, it means we haven't found any of our symbols
+            if undefined.len() == undefined_next.len() {
+                break;
+            } else {
+                undefined = writer.undefined_symbols();
+            }
+        }
         writer.compute_sections();
         let undefined = writer.undefined_symbols();
         if !undefined.is_empty() {
