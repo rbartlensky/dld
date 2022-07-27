@@ -40,13 +40,20 @@ impl Chunk {
         &mut self.relocations
     }
 
-    pub fn apply_relocations(&mut self, got_address: u64, plt_address: u64, table: &SymbolTable) {
+    pub fn apply_relocations(
+        &mut self,
+        got_address: u64,
+        plt_address: u64,
+        table: &SymbolTable,
+        dyn_table: &SymbolTable,
+    ) {
         for (rela, symbol_ref) in &self.relocations {
             apply_relocation(
                 *self.address.as_ref().unwrap(),
                 &mut self.data[..],
                 *rela,
                 table.get(*symbol_ref).unwrap(),
+                dyn_table,
                 got_address,
                 plt_address,
             );
@@ -87,10 +94,19 @@ fn apply_relocation(
     data: &mut [u8],
     rel: Rela,
     symbol: &crate::elf::Symbol<'_>,
+    dyn_table: &SymbolTable,
     got_address: u64,
     plt_address: u64,
 ) {
-    let s: i64 = symbol.st_value.try_into().unwrap();
+    // e.g. `stderr` will be undefined, but we might reference it. Since
+    // `stderr` is an object, we will know its address at runtime because
+    // we will issue a COPY relocation to make a copy of `stderr` for our binary.
+    let s: i64 = match symbol.dynamic() {
+        Some(dyn_sym) if symbol.is_undefined() => {
+            dyn_table.get(dyn_sym).unwrap().st_value.try_into().unwrap()
+        }
+        _ => symbol.st_value.try_into().unwrap(),
+    };
     let a = rel.r_addend;
     let p: i64 = (chunk_address + rel.r_offset).try_into().unwrap();
     let _z = symbol.st_size;

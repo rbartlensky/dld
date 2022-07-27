@@ -5,9 +5,9 @@ use std::{
     path::Path,
 };
 
-use goblin::{
-    elf32::sym::STT_TLS,
-    elf64::sym::{Sym, STB_GLOBAL, STB_LOCAL, STB_WEAK},
+use goblin::elf64::{
+    section_header::SHN_UNDEF,
+    sym::{Sym, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_OBJECT, STT_TLS},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -58,23 +58,31 @@ impl<'r> Symbol<'r> {
         self.st_type() == STT_TLS
     }
 
+    pub const fn is_object(&self) -> bool {
+        self.st_type() == STT_OBJECT
+    }
+
     pub const fn is_local(&self) -> bool {
         self.st_bind() == STB_LOCAL
+    }
+
+    pub const fn is_undefined(&self) -> bool {
+        self.sym.st_shndx == SHN_UNDEF as u16
     }
 
     pub const fn reference(&self) -> &Path {
         self.reference
     }
 
-    pub fn got_offset(&self) -> Option<usize> {
+    pub const fn got_offset(&self) -> Option<usize> {
         self.in_got
     }
 
-    pub fn got_plt_offset(&self) -> Option<usize> {
+    pub const fn got_plt_offset(&self) -> Option<usize> {
         self.in_got_plt
     }
 
-    pub fn plt_index(&self) -> Option<usize> {
+    pub const fn plt_index(&self) -> Option<usize> {
         self.in_plt
     }
 
@@ -90,7 +98,7 @@ impl<'r> Symbol<'r> {
         self.in_plt = Some(index);
     }
 
-    pub fn higher_bind_than(&self, sym: Symbol<'_>) -> bool {
+    pub const fn higher_bind_than(&self, sym: Symbol<'_>) -> bool {
         let s1 = self.st_bind();
         let s2 = sym.st_bind();
         !matches!(
@@ -99,15 +107,15 @@ impl<'r> Symbol<'r> {
         )
     }
 
-    pub fn hash(&self) -> u32 {
+    pub const fn hash(&self) -> u32 {
         self.hash
     }
 
-    pub fn gnu_hash(&self) -> u32 {
+    pub const fn gnu_hash(&self) -> u32 {
         self.gnu_hash
     }
 
-    pub fn dynamic(&self) -> Option<SymbolRef> {
+    pub const fn dynamic(&self) -> Option<SymbolRef> {
         self.dynamic
     }
 
@@ -115,7 +123,7 @@ impl<'r> Symbol<'r> {
         self.dynamic = Some(dynamic);
     }
 
-    pub fn relocation_offset(&self) -> Option<usize> {
+    pub const fn relocation_offset(&self) -> Option<usize> {
         self.relocation_offset
     }
 

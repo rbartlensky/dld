@@ -159,7 +159,7 @@ impl<'p> SymbolTable<'p> {
     }
 
     /// Useful for those cases where we need quick access to a symbol with a given
-    ///st_name, and we want to know its index in the final symbol table.
+    /// st_name, and we want to know its index in the final symbol table.
     pub fn sorted_with_indexes(&mut self) -> HashMap<u32, (usize, &mut Symbol<'p>)> {
         let mut syms: Vec<&mut Symbol<'p>> = self.symbols.values_mut().collect();
         syms.sort_by(|s1, s2| sort_symbols_func(s1, s2));
@@ -188,6 +188,20 @@ impl<'p> SymbolTable<'p> {
 
     pub fn named_mut(&mut self) -> &mut HashMap<u32, Symbol<'p>> {
         &mut self.symbols
+    }
+
+    /// Updates all objects symbols to point to `.copyrel`.
+    /// Note: This assumes that `st_value`s already have the correct offsets
+    /// into `.copyrel`.
+    pub fn update_object_symbols(&mut self, copy_rel_addr: u64, index: usize) {
+        for sym in
+            self.symbols
+                .iter_mut()
+                .filter_map(|(_, sym)| if sym.is_object() { Some(sym) } else { None })
+        {
+            sym.st_value += copy_rel_addr;
+            sym.st_shndx = index as u16;
+        }
     }
 }
 
@@ -317,7 +331,7 @@ impl<'p> Synthesized<'p> for HashTable {
     }
 
     fn as_ref<'k>(kind: &'k SynthesizedKind<'p>) -> Option<&'k Self> {
-        if let SynthesizedKind::Hash(h) = kind {
+        if let SynthesizedKind::HashTable(h) = kind {
             Some(h)
         } else {
             None
@@ -325,7 +339,7 @@ impl<'p> Synthesized<'p> for HashTable {
     }
 
     fn as_ref_mut<'k>(kind: &'k mut SynthesizedKind<'p>) -> Option<&'k mut Self> {
-        if let SynthesizedKind::Hash(h) = kind {
+        if let SynthesizedKind::HashTable(h) = kind {
             Some(h)
         } else {
             None
@@ -431,7 +445,7 @@ impl<'p> Synthesized<'p> for GnuHashTable {
     }
 
     fn as_ref<'k>(kind: &'k SynthesizedKind<'p>) -> Option<&'k Self> {
-        if let SynthesizedKind::GnuHash(h) = kind {
+        if let SynthesizedKind::GnuHashTable(h) = kind {
             Some(h)
         } else {
             None
@@ -439,7 +453,7 @@ impl<'p> Synthesized<'p> for GnuHashTable {
     }
 
     fn as_ref_mut<'k>(kind: &'k mut SynthesizedKind<'p>) -> Option<&'k mut Self> {
-        if let SynthesizedKind::GnuHash(h) = kind {
+        if let SynthesizedKind::GnuHashTable(h) = kind {
             Some(h)
         } else {
             None

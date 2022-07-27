@@ -10,7 +10,7 @@ use goblin::elf64::section_header::{SectionHeader, SHT_NOBITS};
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-use super::SymbolTable;
+use super::{CopyRel, SymbolTable};
 
 pub type SectionPtr<'p> = Arc<RwLock<Section<'p>>>;
 
@@ -65,34 +65,27 @@ impl<'p> SectionBuilder<'p> {
 pub enum SynthesizedKind<'p> {
     Plt(Plt),
     StringTable(StringTable),
-    Hash(HashTable),
-    GnuHash(GnuHashTable),
+    HashTable(HashTable),
+    GnuHashTable(GnuHashTable),
     SymbolTable(SymbolTable<'p>),
+    CopyRel(CopyRel),
 }
 
-impl From<Plt> for SynthesizedKind<'_> {
-    fn from(p: Plt) -> Self {
-        Self::Plt(p)
-    }
+macro_rules! impl_from {
+    ($kind: tt) => {
+        impl From<$kind> for SynthesizedKind<'_> {
+            fn from(p: $kind) -> Self {
+                Self::$kind(p)
+            }
+        }
+    };
 }
 
-impl From<StringTable> for SynthesizedKind<'_> {
-    fn from(p: StringTable) -> Self {
-        Self::StringTable(p)
-    }
-}
-
-impl From<HashTable> for SynthesizedKind<'_> {
-    fn from(p: HashTable) -> Self {
-        Self::Hash(p)
-    }
-}
-
-impl From<GnuHashTable> for SynthesizedKind<'_> {
-    fn from(p: GnuHashTable) -> Self {
-        Self::GnuHash(p)
-    }
-}
+impl_from!(Plt);
+impl_from!(StringTable);
+impl_from!(HashTable);
+impl_from!(GnuHashTable);
+impl_from!(CopyRel);
 
 impl<'p> From<SymbolTable<'p>> for SynthesizedKind<'p> {
     fn from(p: SymbolTable<'p>) -> Self {
@@ -107,9 +100,10 @@ impl<'p> Synthesized<'p> for SynthesizedKind<'p> {
         match self {
             Plt(p) => p.fill_header(sh),
             StringTable(s) => s.fill_header(sh),
-            Hash(h) => h.fill_header(sh),
-            GnuHash(h) => h.fill_header(sh),
+            HashTable(h) => h.fill_header(sh),
+            GnuHashTable(h) => h.fill_header(sh),
             SymbolTable(s) => s.fill_header(sh),
+            CopyRel(s) => s.fill_header(sh),
         }
     }
 
@@ -119,9 +113,10 @@ impl<'p> Synthesized<'p> for SynthesizedKind<'p> {
         match self {
             Plt(p) => p.expand(sh),
             StringTable(s) => s.expand(sh),
-            Hash(h) => h.expand(sh),
-            GnuHash(h) => h.expand(sh),
+            HashTable(h) => h.expand(sh),
+            GnuHashTable(h) => h.expand(sh),
             SymbolTable(s) => s.expand(sh),
+            CopyRel(s) => s.expand(sh),
         }
     }
 
@@ -131,9 +126,10 @@ impl<'p> Synthesized<'p> for SynthesizedKind<'p> {
         match self {
             Plt(p) => p.finalize(sh),
             StringTable(s) => s.finalize(sh),
-            Hash(h) => h.finalize(sh),
-            GnuHash(h) => h.finalize(sh),
+            HashTable(h) => h.finalize(sh),
+            GnuHashTable(h) => h.finalize(sh),
             SymbolTable(s) => s.finalize(sh),
+            CopyRel(s) => s.expand(sh),
         }
     }
 

@@ -28,6 +28,9 @@ use std::{
     sync::Arc,
 };
 
+mod copy_rel;
+pub use copy_rel::CopyRel;
+
 mod options;
 pub use options::*;
 
@@ -162,6 +165,8 @@ pub struct Writer<'d> {
     plt_rel_section: SectionPtr<'d>,
     hash_section: Option<SectionPtr<'d>>,
     gnu_hash_section: Option<SectionPtr<'d>>,
+    // holds the space required by COPY relocations
+    copy_rel_section: SectionPtr<'d>,
 }
 
 impl<'d> Writer<'d> {
@@ -299,6 +304,11 @@ impl<'d> Writer<'d> {
             );
         }
 
+        let copy_rel_section =
+            Section::builder(section_with_name(section_names.get_or_create(".copyrel").offset))
+                .synthetic(CopyRel::default())
+                .build();
+
         let null_section = Section::new(Default::default());
         let shstr_section = Section::builder(Default::default()).synthetic(section_names).build();
         let got_section = Section::new(got_sh);
@@ -325,6 +335,7 @@ impl<'d> Writer<'d> {
             Arc::clone(&dynamic_section),
             Arc::clone(&dyn_rel_section),
             Arc::clone(&plt_rel_section),
+            Arc::clone(&copy_rel_section),
         ];
 
         if let Some(s) = hash_section.clone() {
@@ -361,6 +372,7 @@ impl<'d> Writer<'d> {
             plt_rel_section,
             hash_section,
             gnu_hash_section,
+            copy_rel_section,
         })
     }
 
@@ -467,7 +479,6 @@ impl<'d> Writer<'d> {
         reference: &'d Path,
     ) -> Result<Option<SymbolRef>, ErrorType> {
         elf_sym.st_shndx = SHN_UNDEF as u16;
-        elf_sym.st_size = 0;
         elf_sym.st_value = 0;
         let r = Self::add_symbol_inner(
             elf_sym,
@@ -693,6 +704,11 @@ impl<'d> Writer<'d> {
                 }
             }
         }
+
+        // handle dynamic object symbols
+        let copy_rel = self.copy_rel_section.read();
+        as_mut_sym_tab(&self.dyn_sym_section)
+            .update_object_symbols(copy_rel.sh_addr, copy_rel.index());
     }
 
     fn compute_tables(&mut self) {
@@ -711,6 +727,7 @@ impl<'d> Writer<'d> {
         // populate .rela.{dyn,plt} sections
         let got_addr = self.got_address();
         let got_plt_addr = self.got_plt_address();
+        let copy_rel_addr = self.copy_rel_section.read().sh_addr;
         for (section, rels) in [
             (&self.dyn_rel_section, &mut self.dyn_rels),
             (&self.plt_rel_section, &mut self.plt_rels),
@@ -721,6 +738,7 @@ impl<'d> Writer<'d> {
                 match r_type(rel.r_info) {
                     R_X86_64_GLOB_DAT => rel.r_offset += got_addr,
                     R_X86_64_JUMP_SLOT => rel.r_offset += got_plt_addr,
+                    R_X86_64_COPY => rel.r_offset += copy_rel_addr,
                     _ => {}
                 }
                 rel.serialize(&mut data);
@@ -811,39 +829,47 @@ impl<'d> Writer<'d> {
         }
 
         {
+            // mappings from dyn_sym to their index in the dyn sym section
+            let dyn_sym_indices = sorted
+                .iter()
+                .enumerate()
+                .map(|(i, dyn_sym)| (dyn_sym.st_name, i))
+                .collect::<HashMap<_, _>>();
+            drop(dyn_syms);
+
             let mut symbols = as_mut_sym_tab(&self.sym_section);
+            let mut dyn_syms = as_mut_sym_tab(&self.dyn_sym_section);
             let section_names = as_str_tab(&self.shstr_section);
+
             for (sym, dyn_sym) in
                 symbols.named_mut().values_mut().filter_map(|s| s.dynamic().map(|d| (s, d)))
             {
-                let mut calculated_index = None;
-                let mut index = || {
-                    if let Some(index) = calculated_index {
-                        index
-                    } else {
-                        let index = sorted
-                            .iter()
-                            .enumerate()
-                            .find(|(_, s)| s.st_name == dyn_sym.st_name())
-                            .map(|(i, _)| i)
-                            .unwrap();
-                        calculated_index = Some(index);
-                        index
-                    }
-                };
+                let index = dyn_sym_indices[&dyn_sym.st_name()];
                 if let Some(offset) = sym.got_offset() {
-                    self.dyn_rels.push(rela(offset, index(), R_X86_64_GLOB_DAT));
+                    self.dyn_rels.push(rela(offset, index, R_X86_64_GLOB_DAT));
+                }
+                let dyn_symbol = &mut dyn_syms.get_mut(dyn_sym).unwrap();
+                if dyn_symbol.is_object() {
+                    let size = dyn_symbol.st_size;
+                    let offset = self
+                        .copy_rel_section
+                        .write()
+                        .inner_mut::<CopyRel>()
+                        .unwrap()
+                        .insert(dyn_sym, size);
+                    self.dyn_rels.push(rela(offset as usize, index, R_X86_64_COPY));
+                    dyn_symbol.st_value = offset;
                 }
                 if let Some(offset) = sym.got_plt_offset() {
                     sym.set_relocation_offset(self.plt_rels.len());
-                    self.plt_rels.push(rela(offset, index(), R_X86_64_JUMP_SLOT));
+                    self.plt_rels.push(rela(offset, index, R_X86_64_JUMP_SLOT));
                 }
             }
             self.dyn_rel_section.write().sh_size = (self.dyn_rels.len() * size_of::<Rela>()) as u64;
-
             self.plt_rel_section.write().sh_size = (self.plt_rels.len() * size_of::<Rela>()) as u64;
 
             drop(symbols);
+            drop(dyn_syms);
             // calculate how many dyntags we have, so that we know how big our dynamic section is
             // + 1 for the null entry
             let extra_dyn_entries =
@@ -851,7 +877,6 @@ impl<'d> Writer<'d> {
             self.dynamic_section.write().sh_size =
                 ((self.dyn_entries.len() + extra_dyn_entries) * 2 * size_of::<u64>()) as u64;
         }
-        drop(dyn_syms);
 
         self.sort_sections();
 
@@ -865,19 +890,22 @@ impl<'d> Writer<'d> {
     fn handle_relocations(&mut self) {
         let got_address = self.got_address();
         let plt_address = self.plt_address();
-        let sh_name = self.sym_section.read().sh_name;
+        let sh_names = [self.sym_section.read().sh_name, self.dyn_sym_section.read().sh_name];
 
         // first patch symbol values
-        for section in &mut self.sections.iter_mut().skip(1).filter(|s| s.read().sh_name != sh_name)
+        for section in
+            &mut self.sections.iter_mut().skip(1).filter(|s| !sh_names.contains(&s.read().sh_name))
         {
             let mut symbols = as_mut_sym_tab(&self.sym_section);
             section.write().patch_symbol_values(&mut symbols);
         }
         let symbols = as_sym_tab(&self.sym_section);
-        for section in &mut self.sections.iter_mut().skip(1).filter(|s| s.read().sh_name != sh_name)
+        let dyn_symbols = as_sym_tab(&self.dyn_sym_section);
+        for section in
+            &mut self.sections.iter_mut().skip(1).filter(|s| !sh_names.contains(&s.read().sh_name))
         {
             for chunk in section.write().chunks_mut() {
-                chunk.apply_relocations(got_address, plt_address, &symbols);
+                chunk.apply_relocations(got_address, plt_address, &symbols, &dyn_symbols);
             }
         }
     }
